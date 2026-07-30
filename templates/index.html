@@ -3,205 +3,569 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Discord Username Validator + guns.lol Bot</title>
+    <title>Discord Username Sniper + guns.lol Bot</title>
     <style>
+        :root {
+            --bg: #08090a;
+            --surface: #111318;
+            --surface2: #1a1d25;
+            --border: #252830;
+            --discord: #5865f2;
+            --green: #3ba55c;
+            --red: #ed4245;
+            --gold: #faa61a;
+            --text: #dbdee1;
+            --muted: #949ba4;
+            --radius: 14px;
+            --transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
         * { margin: 0; padding: 0; box-sizing: border-box; }
+
         body {
-            background: #0d0d0d;
-            color: #fff;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
             min-height: 100vh;
             display: flex;
             flex-direction: column;
             align-items: center;
-            padding: 40px 20px;
+            padding: 24px 16px;
+            -webkit-font-smoothing: antialiased;
         }
-        h1 { color: #5865f2; margin-bottom: 30px; font-size: 2.5em; text-shadow: 0 0 20px rgba(88,101,242,0.5); }
-        .container {
-            background: #1a1a1a;
-            border-radius: 16px;
-            padding: 40px;
-            width: 100%;
-            max-width: 900px;
-            border: 1px solid #333;
-            box-shadow: 0 0 40px rgba(0,0,0,0.5);
+
+        /* ── Glow orbs ── */
+        .glow-orb {
+            position: fixed;
+            border-radius: 50%;
+            filter: blur(120px);
+            opacity: 0.07;
+            pointer-events: none;
+            z-index: 0;
         }
-        .section { margin-bottom: 40px; }
-        .section h2 { color: #00ff88; margin-bottom: 20px; font-size: 1.5em; }
-        .btn-group { display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 20px; }
-        button {
-            background: linear-gradient(135deg, #5865f2, #4752c4);
-            color: white;
-            border: none;
-            padding: 15px 30px;
-            border-radius: 12px;
-            font-size: 1.1em;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            box-shadow: 0 4px 15px rgba(88,101,242,0.3);
+        .glow-orb.orb1 { width: 500px; height: 500px; background: #5865f2; top: -200px; left: -150px; }
+        .glow-orb.orb2 { width: 400px; height: 400px; background: #3ba55c; bottom: -150px; right: -100px; }
+
+        /* ── Header ── */
+        header {
+            text-align: center;
+            margin-bottom: 32px;
+            z-index: 1;
         }
-        button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 25px rgba(88,101,242,0.5);
+        header h1 {
+            font-size: clamp(1.8em, 4vw, 2.6em);
+            font-weight: 800;
+            background: linear-gradient(135deg, var(--discord), #7b83f6);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            letter-spacing: -0.02em;
         }
-        button.guns {
-            background: linear-gradient(135deg, #ff4757, #ff6b81);
-            box-shadow: 0 4px 15px rgba(255,71,87,0.3);
-        }
-        button.guns:hover {
-            box-shadow: 0 6px 25px rgba(255,71,87,0.5);
-        }
-        .status {
-            background: #0f0f0f;
-            border-radius: 8px;
-            padding: 20px;
-            margin-top: 20px;
-            border: 1px solid #333;
-            min-height: 100px;
-        }
-        .status-item {
-            padding: 8px 0;
-            border-bottom: 1px solid #222;
-            font-family: monospace;
+        header p {
+            color: var(--muted);
+            margin-top: 6px;
             font-size: 0.95em;
         }
-        .available { color: #00ff88; }
-        .taken { color: #ff4757; }
-        .loading { color: #ffd700; }
-        #viewCounter {
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            background: #1a1a1a;
-            border: 2px solid #ff4757;
-            padding: 15px 25px;
-            border-radius: 12px;
+
+        /* ── Status bar ── */
+        .top-bar {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            justify-content: center;
+            margin-bottom: 20px;
+            z-index: 1;
+        }
+        .badge {
+            font-size: 0.8em;
+            font-weight: 600;
+            padding: 6px 14px;
+            border-radius: 20px;
+            background: var(--surface2);
+            border: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: var(--transition);
+        }
+        .badge .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+        .dot.online { background: var(--green); box-shadow: 0 0 6px var(--green); }
+        .dot.offline { background: var(--red); }
+        .badge.views { border-color: var(--red); color: var(--red); }
+
+        /* ── Main grid ── */
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            width: 100%;
+            max-width: 960px;
+            z-index: 1;
+        }
+        @media (max-width: 700px) { .main-grid { grid-template-columns: 1fr; } }
+
+        /* ── Card ── */
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 28px;
+            transition: var(--transition);
+        }
+        .card:hover { border-color: #353a48; }
+        .card h2 {
             font-size: 1.2em;
-            font-weight: bold;
-            color: #ff4757;
-            box-shadow: 0 0 20px rgba(255,71,87,0.3);
+            font-weight: 700;
+            margin-bottom: 6px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
-        .input-group { margin-bottom: 20px; }
-        input[type="url"] {
+        .card .sub {
+            color: var(--muted);
+            font-size: 0.85em;
+            margin-bottom: 18px;
+            line-height: 1.5;
+        }
+
+        /* ── Inputs ── */
+        .input-group { margin-bottom: 14px; }
+        .input-group label {
+            display: block;
+            font-size: 0.8em;
+            font-weight: 600;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 6px;
+        }
+        input[type="text"],
+        input[type="url"],
+        input[type="password"] {
             width: 100%;
-            padding: 12px 16px;
-            background: #0f0f0f;
-            border: 1px solid #333;
+            padding: 11px 14px;
+            background: var(--surface2);
+            border: 1px solid var(--border);
             border-radius: 8px;
-            color: #fff;
-            font-size: 1em;
+            color: var(--text);
+            font-size: 0.93em;
+            font-family: inherit;
+            transition: var(--transition);
+            outline: none;
         }
-        input[type="url"]:focus { outline: none; border-color: #5865f2; }
-        .progress-bar {
-            width: 100%;
-            height: 6px;
-            background: #222;
-            border-radius: 3px;
-            margin-top: 15px;
+        input:focus { border-color: var(--discord); box-shadow: 0 0 0 3px rgba(88,101,242,0.15); }
+
+        /* ── Buttons ── */
+        .btn-row { display: flex; gap: 10px; flex-wrap: wrap; }
+        button {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            padding: 11px 22px;
+            border-radius: 10px;
+            font-size: 0.9em;
+            font-weight: 600;
+            font-family: inherit;
+            cursor: pointer;
+            border: none;
+            transition: all var(--transition);
+            position: relative;
             overflow: hidden;
         }
-        .progress-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #5865f2, #00ff88);
-            width: 0%;
-            transition: width 0.3s ease;
+        button:active { transform: scale(0.97); }
+        button:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+
+        .btn-primary {
+            background: var(--discord);
+            color: #fff;
+            box-shadow: 0 2px 12px rgba(88,101,242,0.3);
         }
+        .btn-primary:hover:not(:disabled) {
+            background: #4752c4;
+            box-shadow: 0 4px 20px rgba(88,101,242,0.45);
+        }
+        .btn-danger {
+            background: linear-gradient(135deg, #ed4245, #f04747);
+            color: #fff;
+            box-shadow: 0 2px 12px rgba(237,66,69,0.25);
+        }
+        .btn-danger:hover:not(:disabled) {
+            box-shadow: 0 4px 20px rgba(237,66,69,0.45);
+        }
+        .btn-outline {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text);
+        }
+        .btn-outline:hover:not(:disabled) {
+            background: var(--surface2);
+            border-color: #454a55;
+        }
+
+        /* ── Status box ── */
+        .status-box {
+            background: var(--surface2);
+            border-radius: 10px;
+            padding: 16px;
+            margin-top: 16px;
+            border: 1px solid var(--border);
+            min-height: 120px;
+            max-height: 420px;
+            overflow-y: auto;
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+            font-size: 0.82em;
+            line-height: 1.7;
+        }
+        .status-box:empty::after {
+            content: "Waiting for action...";
+            color: var(--muted);
+        }
+        .log-entry { padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.03); display: flex; align-items: center; gap: 8px; animation: fadeIn 0.2s ease; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+        .log-entry.found { color: var(--green); }
+        .log-entry.error { color: var(--red); }
+        .log-entry.progress { color: var(--muted); }
+
+        /* ── Progress bar ── */
+        .progress-wrap { margin-top: 14px; }
+        .progress-outer {
+            width: 100%;
+            height: 6px;
+            background: var(--surface2);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        .progress-inner {
+            height: 100%;
+            background: linear-gradient(90deg, var(--discord), var(--green));
+            border-radius: 3px;
+            transition: width 0.4s ease;
+            width: 0%;
+        }
+        .progress-label {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 6px;
+            font-size: 0.75em;
+            color: var(--muted);
+        }
+
+        /* ── Spinner ── */
+        .spinner {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid rgba(255,255,255,0.2);
+            border-top-color: #fff;
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* ── Available badges ── */
+        .found-badges {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        .found-badge {
+            background: rgba(59,165,92,0.12);
+            color: var(--green);
+            border: 1px solid rgba(59,165,92,0.25);
+            padding: 5px 12px;
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 0.85em;
+            font-weight: 600;
+            animation: popIn 0.3s ease;
+        }
+        @keyframes popIn { from { transform: scale(0.8); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+
+        /* ── Toast ── */
+        .toast {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--surface);
+            border: 1px solid var(--border);
+            padding: 12px 24px;
+            border-radius: 10px;
+            font-size: 0.85em;
+            box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+            z-index: 999;
+            animation: slideUp 0.3s ease;
+        }
+        @keyframes slideUp { from { transform: translateX(-50%) translateY(30px); opacity: 0; } }
+
+        /* ── Scrollbar ── */
+        .status-box::-webkit-scrollbar { width: 5px; }
+        .status-box::-webkit-scrollbar-track { background: transparent; }
+        .status-box::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
     </style>
 </head>
 <body>
-    <div id="viewCounter">Views: 0</div>
-    
-    <h1>🔥 Discord Validator + guns.lol Bot</h1>
-    
-    <div class="container">
-        <div class="section">
-            <h2>Discord Username Checker</h2>
-            <p style="color: #888; margin-bottom: 20px;">Check availability of all 3-letter and 4-letter usernames using 5 parallel Tor instances</p>
-            <div class="btn-group">
-                <button onclick="startCheck(3)">🔍 3 Letters</button>
-                <button onclick="startCheck(4)">🔍 4 Letters</button>
-            </div>
-            <div class="progress-bar"><div class="progress-fill" id="progressBar"></div></div>
-            <div class="status" id="discordStatus">
-                <div class="status-item loading">Click a button to start checking...</div>
-            </div>
-        </div>
-        
-        <div class="section">
-            <h2>guns.lol View Bot</h2>
-            <p style="color: #888; margin-bottom: 20px;">Automated view bot using 3 Tor browsers with rotating proxies, cache clearing, and IP rotation</p>
+
+    <div class="glow-orb orb1"></div>
+    <div class="glow-orb orb2"></div>
+
+    <header>
+        <h1>&#x1F525; Discord Username Sniper + guns.lol Bot</h1>
+        <p>Live-check 2–4 letter Discord usernames &middot; Auto view-bot for guns.lol</p>
+    </header>
+
+    <div class="top-bar">
+        <div class="badge" id="torBadge"><span class="dot offline"></span> Tor: checking...</div>
+        <div class="badge views" id="viewBadge">&#x1F441; Views: 0</div>
+    </div>
+
+    <div class="main-grid">
+
+        <!-- ── Discord checker card ── -->
+        <div class="card">
+            <h2>&#x1F50D; Username Checker</h2>
+            <p class="sub">Enter your Discord token, pick a length, and find available short usernames live.</p>
+
             <div class="input-group">
+                <label>Discord Auth Token</label>
+                <input type="password" id="authToken" placeholder="Paste your Discord authorization token...">
+            </div>
+
+            <div class="btn-row">
+                <button class="btn-primary" onclick="startCheck(2)">2 Letters</button>
+                <button class="btn-primary" onclick="startCheck(3)">3 Letters</button>
+                <button class="btn-primary" onclick="startCheck(4)">4 Letters</button>
+                <button class="btn-outline" id="btnStop" onclick="stopCheck()" disabled>Stop</button>
+            </div>
+
+            <div class="progress-wrap">
+                <div class="progress-outer"><div class="progress-inner" id="progressBar"></div></div>
+                <div class="progress-label"><span id="progressText">0 / 0</span><span id="foundCount">Found: 0</span></div>
+            </div>
+
+            <div class="found-badges" id="foundBadges"></div>
+
+            <div class="status-box" id="discordLog"></div>
+        </div>
+
+        <!-- ── guns.lol card ── -->
+        <div class="card">
+            <h2>&#x1F4C8; guns.lol View Bot</h2>
+            <p class="sub">Rotating-proxy view bot. Uses Chrome headless with proxy rotation &amp; cache clearing. Falls back to requests if Chrome unavailable.</p>
+
+            <div class="input-group">
+                <label>Target URL</label>
                 <input type="url" id="gunsUrl" placeholder="https://guns.lol/yourusername" value="https://guns.lol/username">
             </div>
-            <button class="guns" onclick="startGuns()">🚀 Start guns.lol Bot</button>
-            <div class="status" id="gunsStatus">
-                <div class="status-item loading">Enter URL and click start...</div>
+
+            <div class="input-group">
+                <label>Number of browsers</label>
+                <input type="text" id="browserCount" placeholder="3" value="3" style="width:80px;">
             </div>
+
+            <button class="btn-danger" onclick="startGuns()">&#x1F680; Start Bot</button>
+
+            <div class="status-box" id="gunsLog"></div>
         </div>
+
     </div>
 
     <script>
+        let abortController = null;
         let checking = false;
-        
+        let foundUsernames = [];
+        let viewInterval = null;
+
+        // ── init: check server status ──
+        (async function init() {
+            try {
+                const r = await fetch('/status');
+                const s = await r.json();
+                updateTorBadge(s.tor_available, s.tor_instances);
+            } catch (e) {
+                updateTorBadge(false, 0);
+            }
+            viewInterval = setInterval(updateViews, 2500);
+            updateViews();
+        })();
+
+        function updateTorBadge(available, count) {
+            const b = document.getElementById('torBadge');
+            if (available) {
+                b.innerHTML = `<span class="dot online"></span> Tor: ${count} circuits`;
+            } else {
+                b.innerHTML = `<span class="dot offline"></span> Tor: unavailable (direct)`;
+            }
+        }
+
+        async function updateViews() {
+            try {
+                const r = await fetch('/view_count');
+                const d = await r.json();
+                document.getElementById('viewBadge').innerHTML = `&#x1F441; Views: ${d.views}`;
+            } catch (e) {}
+        }
+
+        // ── Username checker ──
         async function startCheck(length) {
             if (checking) return;
+
+            const token = document.getElementById('authToken').value.trim();
+            if (!token) return toast('Please enter your Discord auth token first.');
+
             checking = true;
-            const status = document.getElementById('discordStatus');
-            const progress = document.getElementById('progressBar');
-            status.innerHTML = '<div class="status-item loading">Initializing Tor circuits...</div>';
-            
-            const endpoint = length === 3 ? '/check_3letters' : '/check_4letters';
-            const total = length === 3 ? 17576 : 456976;
-            
+            foundUsernames = [];
+            abortController = new AbortController();
+
+            const log = document.getElementById('discordLog');
+            const progressBar = document.getElementById('progressBar');
+            const progressText = document.getElementById('progressText');
+            const foundCountEl = document.getElementById('foundCount');
+            const badges = document.getElementById('foundBadges');
+            const btnStop = document.getElementById('btnStop');
+
+            log.innerHTML = '';
+            badges.innerHTML = '';
+            progressBar.style.width = '0%';
+            foundCountEl.textContent = 'Found: 0';
+            btnStop.disabled = false;
+
+            logEntry(log, `Starting ${length}-letter check...`, 'progress');
+
             try {
-                const response = await fetch(endpoint);
-                const data = await response.json();
-                
-                status.innerHTML = '';
-                if (data.available.length === 0) {
-                    status.innerHTML = '<div class="status-item taken">No available usernames found.</div>';
-                } else {
-                    data.available.forEach(u => {
-                        status.innerHTML += `<div class="status-item available">✓ ${u} is AVAILABLE</div>`;
-                    });
+                const resp = await fetch('/check_usernames', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ length, auth_token: token, use_proxy: true }),
+                    signal: abortController.signal,
+                });
+
+                const reader = resp.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        try {
+                            const event = JSON.parse(line.slice(6));
+                            handleSSEEvent(event, length, log, progressBar, progressText, foundCountEl, badges);
+                        } catch (e) {}
+                    }
                 }
-                status.innerHTML += `<div class="status-item" style="color: #888; margin-top: 10px;">Checked ${data.checked} combinations total</div>`;
-                progress.style.width = '100%';
             } catch (e) {
-                status.innerHTML = `<div class="status-item taken">Error: ${e.message}</div>`;
+                if (e.name !== 'AbortError') {
+                    logEntry(log, `Connection error: ${e.message}`, 'error');
+                }
             } finally {
                 checking = false;
+                btnStop.disabled = true;
+                abortController = null;
             }
         }
-        
+
+        function handleSSEEvent(event, length, log, progressBar, progressText, foundCountEl, badges) {
+            switch (event.event) {
+                case 'found':
+                    foundUsernames.push(event.username);
+                    logEntry(log, `&#x2705; ${event.username} — AVAILABLE`, 'found');
+                    foundCountEl.textContent = `Found: ${foundUsernames.length}`;
+                    const badge = document.createElement('span');
+                    badge.className = 'found-badge';
+                    badge.textContent = event.username;
+                    badges.appendChild(badge);
+                    progressBar.style.width = `${(event.checked / event.total * 100).toFixed(1)}%`;
+                    progressText.textContent = `${event.checked.toLocaleString()} / ${event.total.toLocaleString()}`;
+                    break;
+
+                case 'progress':
+                    progressBar.style.width = `${(event.checked / event.total * 100).toFixed(1)}%`;
+                    progressText.textContent = `${event.checked.toLocaleString()} / ${event.total.toLocaleString()}`;
+                    break;
+
+                case 'error':
+                    logEntry(log, `&#x274C; ${event.message}`, 'error');
+                    break;
+
+                case 'complete':
+                    progressBar.style.width = '100%';
+                    progressText.textContent = `${event.checked.toLocaleString()} / ${event.total.toLocaleString()}`;
+                    if (event.available.length === 0) {
+                        logEntry(log, `Done — no available ${length}-letter usernames found.`, 'progress');
+                    } else {
+                        logEntry(log, `Done! Found ${event.available.length} available username(s).`, 'progress');
+                    }
+                    break;
+            }
+        }
+
+        function stopCheck() {
+            if (abortController) {
+                abortController.abort();
+                abortController = null;
+            }
+            checking = false;
+            document.getElementById('btnStop').disabled = true;
+            logEntry(document.getElementById('discordLog'), 'Stopped by user.', 'progress');
+        }
+
+        function logEntry(container, msg, cls) {
+            const div = document.createElement('div');
+            div.className = `log-entry ${cls || ''}`;
+            div.innerHTML = msg;
+            container.appendChild(div);
+            container.scrollTop = container.scrollHeight;
+        }
+
+        // ── guns.lol bot ──
         async function startGuns() {
-            const url = document.getElementById('gunsUrl').value;
-            const status = document.getElementById('gunsStatus');
-            status.innerHTML = '<div class="status-item loading">Starting 3 Tor browsers...</div>';
-            
+            const url = document.getElementById('gunsUrl').value.trim();
+            const browsers = parseInt(document.getElementById('browserCount').value) || 3;
+            const log = document.getElementById('gunsLog');
+
+            if (!url) return toast('Please enter a target URL.');
+
+            log.innerHTML = '';
+            logEntry(log, `Starting ${browsers} browser bot(s) targeting ${url}...`, 'progress');
+
             try {
-                const response = await fetch('/start_guns_lol', {
+                const resp = await fetch('/start_guns_lol', {
                     method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({url: url})
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url, browsers }),
                 });
-                const data = await response.json();
-                status.innerHTML = `<div class="status-item available">✓ Bot started with ${data.browsers} browsers</div>`;
-                updateViewCount();
+                const data = await resp.json();
+                if (data.error) {
+                    logEntry(log, `&#x274C; ${data.error}`, 'error');
+                } else {
+                    logEntry(log, `&#x2705; Bot started with ${data.browsers} browser(s). Views incrementing...`, 'found');
+                }
             } catch (e) {
-                status.innerHTML = `<div class="status-item taken">Error: ${e.message}</div>`;
+                logEntry(log, `&#x274C; Error: ${e.message}`, 'error');
             }
         }
-        
-        async function updateViewCount() {
-            setInterval(async () => {
-                try {
-                    const response = await fetch('/view_count');
-                    const data = await response.json();
-                    document.getElementById('viewCounter').textContent = `Views: ${data.views}`;
-                } catch (e) {}
-            }, 2000);
+
+        // ── Toast ──
+        function toast(msg) {
+            const t = document.createElement('div');
+            t.className = 'toast';
+            t.textContent = msg;
+            document.body.appendChild(t);
+            setTimeout(() => { t.style.opacity = '0'; t.style.transition = 'opacity 0.3s'; }, 2500);
+            setTimeout(() => t.remove(), 2900);
         }
     </script>
 </body>
