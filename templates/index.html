@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Discord Username Validator + guns.lol Bot</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #0d0d0d;
+            color: #fff;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 40px 20px;
+        }
+        h1 { color: #5865f2; margin-bottom: 30px; font-size: 2.5em; text-shadow: 0 0 20px rgba(88,101,242,0.5); }
+        .container {
+            background: #1a1a1a;
+            border-radius: 16px;
+            padding: 40px;
+            width: 100%;
+            max-width: 900px;
+            border: 1px solid #333;
+            box-shadow: 0 0 40px rgba(0,0,0,0.5);
+        }
+        .section { margin-bottom: 40px; }
+        .section h2 { color: #00ff88; margin-bottom: 20px; font-size: 1.5em; }
+        .btn-group { display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 20px; }
+        button {
+            background: linear-gradient(135deg, #5865f2, #4752c4);
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 12px;
+            font-size: 1.1em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(88,101,242,0.3);
+        }
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 25px rgba(88,101,242,0.5);
+        }
+        button.guns {
+            background: linear-gradient(135deg, #ff4757, #ff6b81);
+            box-shadow: 0 4px 15px rgba(255,71,87,0.3);
+        }
+        button.guns:hover {
+            box-shadow: 0 6px 25px rgba(255,71,87,0.5);
+        }
+        .status {
+            background: #0f0f0f;
+            border-radius: 8px;
+            padding: 20px;
+            margin-top: 20px;
+            border: 1px solid #333;
+            min-height: 100px;
+        }
+        .status-item {
+            padding: 8px 0;
+            border-bottom: 1px solid #222;
+            font-family: monospace;
+            font-size: 0.95em;
+        }
+        .available { color: #00ff88; }
+        .taken { color: #ff4757; }
+        .loading { color: #ffd700; }
+        #viewCounter {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: #1a1a1a;
+            border: 2px solid #ff4757;
+            padding: 15px 25px;
+            border-radius: 12px;
+            font-size: 1.2em;
+            font-weight: bold;
+            color: #ff4757;
+            box-shadow: 0 0 20px rgba(255,71,87,0.3);
+        }
+        .input-group { margin-bottom: 20px; }
+        input[type="url"] {
+            width: 100%;
+            padding: 12px 16px;
+            background: #0f0f0f;
+            border: 1px solid #333;
+            border-radius: 8px;
+            color: #fff;
+            font-size: 1em;
+        }
+        input[type="url"]:focus { outline: none; border-color: #5865f2; }
+        .progress-bar {
+            width: 100%;
+            height: 6px;
+            background: #222;
+            border-radius: 3px;
+            margin-top: 15px;
+            overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #5865f2, #00ff88);
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+    </style>
+</head>
+<body>
+    <div id="viewCounter">Views: 0</div>
+    
+    <h1>🔥 Discord Validator + guns.lol Bot</h1>
+    
+    <div class="container">
+        <div class="section">
+            <h2>Discord Username Checker</h2>
+            <p style="color: #888; margin-bottom: 20px;">Check availability of all 3-letter and 4-letter usernames using 5 parallel Tor instances</p>
+            <div class="btn-group">
+                <button onclick="startCheck(3)">🔍 3 Letters</button>
+                <button onclick="startCheck(4)">🔍 4 Letters</button>
+            </div>
+            <div class="progress-bar"><div class="progress-fill" id="progressBar"></div></div>
+            <div class="status" id="discordStatus">
+                <div class="status-item loading">Click a button to start checking...</div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2>guns.lol View Bot</h2>
+            <p style="color: #888; margin-bottom: 20px;">Automated view bot using 3 Tor browsers with rotating proxies, cache clearing, and IP rotation</p>
+            <div class="input-group">
+                <input type="url" id="gunsUrl" placeholder="https://guns.lol/yourusername" value="https://guns.lol/username">
+            </div>
+            <button class="guns" onclick="startGuns()">🚀 Start guns.lol Bot</button>
+            <div class="status" id="gunsStatus">
+                <div class="status-item loading">Enter URL and click start...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let checking = false;
+        
+        async function startCheck(length) {
+            if (checking) return;
+            checking = true;
+            const status = document.getElementById('discordStatus');
+            const progress = document.getElementById('progressBar');
+            status.innerHTML = '<div class="status-item loading">Initializing Tor circuits...</div>';
+            
+            const endpoint = length === 3 ? '/check_3letters' : '/check_4letters';
+            const total = length === 3 ? 17576 : 456976;
+            
+            try {
+                const response = await fetch(endpoint);
+                const data = await response.json();
+                
+                status.innerHTML = '';
+                if (data.available.length === 0) {
+                    status.innerHTML = '<div class="status-item taken">No available usernames found.</div>';
+                } else {
+                    data.available.forEach(u => {
+                        status.innerHTML += `<div class="status-item available">✓ ${u} is AVAILABLE</div>`;
+                    });
+                }
+                status.innerHTML += `<div class="status-item" style="color: #888; margin-top: 10px;">Checked ${data.checked} combinations total</div>`;
+                progress.style.width = '100%';
+            } catch (e) {
+                status.innerHTML = `<div class="status-item taken">Error: ${e.message}</div>`;
+            } finally {
+                checking = false;
+            }
+        }
+        
+        async function startGuns() {
+            const url = document.getElementById('gunsUrl').value;
+            const status = document.getElementById('gunsStatus');
+            status.innerHTML = '<div class="status-item loading">Starting 3 Tor browsers...</div>';
+            
+            try {
+                const response = await fetch('/start_guns_lol', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({url: url})
+                });
+                const data = await response.json();
+                status.innerHTML = `<div class="status-item available">✓ Bot started with ${data.browsers} browsers</div>`;
+                updateViewCount();
+            } catch (e) {
+                status.innerHTML = `<div class="status-item taken">Error: ${e.message}</div>`;
+            }
+        }
+        
+        async function updateViewCount() {
+            setInterval(async () => {
+                try {
+                    const response = await fetch('/view_count');
+                    const data = await response.json();
+                    document.getElementById('viewCounter').textContent = `Views: ${data.views}`;
+                } catch (e) {}
+            }, 2000);
+        }
+    </script>
+</body>
+</html>
