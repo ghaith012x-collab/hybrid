@@ -34,7 +34,6 @@
             -webkit-font-smoothing: antialiased;
         }
 
-        /* ── Glow orbs ── */
         .glow-orb {
             position: fixed;
             border-radius: 50%;
@@ -46,7 +45,6 @@
         .glow-orb.orb1 { width: 500px; height: 500px; background: #5865f2; top: -200px; left: -150px; }
         .glow-orb.orb2 { width: 400px; height: 400px; background: #3ba55c; bottom: -150px; right: -100px; }
 
-        /* ── Header ── */
         header {
             text-align: center;
             margin-bottom: 32px;
@@ -61,13 +59,8 @@
             background-clip: text;
             letter-spacing: -0.02em;
         }
-        header p {
-            color: var(--muted);
-            margin-top: 6px;
-            font-size: 0.95em;
-        }
+        header p { color: var(--muted); margin-top: 6px; font-size: 0.95em; }
 
-        /* ── Status bar ── */
         .top-bar {
             display: flex;
             gap: 12px;
@@ -98,7 +91,6 @@
         .dot.offline { background: var(--red); }
         .badge.views { border-color: var(--red); color: var(--red); }
 
-        /* ── Main grid ── */
         .main-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -109,7 +101,6 @@
         }
         @media (max-width: 700px) { .main-grid { grid-template-columns: 1fr; } }
 
-        /* ── Card ── */
         .card {
             background: var(--surface);
             border: 1px solid var(--border);
@@ -133,7 +124,6 @@
             line-height: 1.5;
         }
 
-        /* ── Inputs ── */
         .input-group { margin-bottom: 14px; }
         .input-group label {
             display: block;
@@ -144,6 +134,8 @@
             letter-spacing: 0.05em;
             margin-bottom: 6px;
         }
+        .input-row { display: flex; gap: 8px; }
+        .input-row input { flex: 1; }
         input[type="text"],
         input[type="url"],
         input[type="password"] {
@@ -159,8 +151,9 @@
             outline: none;
         }
         input:focus { border-color: var(--discord); box-shadow: 0 0 0 3px rgba(88,101,242,0.15); }
+        input.valid { border-color: var(--green) !important; }
+        input.invalid { border-color: var(--red) !important; }
 
-        /* ── Buttons ── */
         .btn-row { display: flex; gap: 10px; flex-wrap: wrap; }
         button {
             display: inline-flex;
@@ -180,34 +173,29 @@
         button:active { transform: scale(0.97); }
         button:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
 
-        .btn-primary {
-            background: var(--discord);
-            color: #fff;
-            box-shadow: 0 2px 12px rgba(88,101,242,0.3);
-        }
-        .btn-primary:hover:not(:disabled) {
-            background: #4752c4;
-            box-shadow: 0 4px 20px rgba(88,101,242,0.45);
-        }
-        .btn-danger {
-            background: linear-gradient(135deg, #ed4245, #f04747);
-            color: #fff;
-            box-shadow: 0 2px 12px rgba(237,66,69,0.25);
-        }
-        .btn-danger:hover:not(:disabled) {
-            box-shadow: 0 4px 20px rgba(237,66,69,0.45);
-        }
+        .btn-primary { background: var(--discord); color: #fff; box-shadow: 0 2px 12px rgba(88,101,242,0.3); }
+        .btn-primary:hover:not(:disabled) { background: #4752c4; box-shadow: 0 4px 20px rgba(88,101,242,0.45); }
+        .btn-danger { background: linear-gradient(135deg, #ed4245, #f04747); color: #fff; box-shadow: 0 2px 12px rgba(237,66,69,0.25); }
+        .btn-danger:hover:not(:disabled) { box-shadow: 0 4px 20px rgba(237,66,69,0.45); }
         .btn-outline {
             background: transparent;
             border: 1px solid var(--border);
             color: var(--text);
         }
-        .btn-outline:hover:not(:disabled) {
-            background: var(--surface2);
-            border-color: #454a55;
-        }
+        .btn-outline:hover:not(:disabled) { background: var(--surface2); border-color: #454a55; }
+        .btn-sm { padding: 6px 14px; font-size: 0.78em; border-radius: 7px; }
 
-        /* ── Status box ── */
+        .token-status {
+            font-size: 0.78em;
+            margin-top: 6px;
+            min-height: 18px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .token-status.ok { color: var(--green); }
+        .token-status.bad { color: var(--red); }
+
         .status-box {
             background: var(--surface2);
             border-radius: 10px;
@@ -221,17 +209,21 @@
             font-size: 0.82em;
             line-height: 1.7;
         }
-        .status-box:empty::after {
-            content: "Waiting for action...";
-            color: var(--muted);
+        .status-box:empty::after { content: "Waiting..."; color: var(--muted); }
+        .log-entry {
+            padding: 3px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.03);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            animation: fadeIn 0.2s ease;
         }
-        .log-entry { padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.03); display: flex; align-items: center; gap: 8px; animation: fadeIn 0.2s ease; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
         .log-entry.found { color: var(--green); }
         .log-entry.error { color: var(--red); }
+        .log-entry.warn { color: var(--gold); }
         .log-entry.progress { color: var(--muted); }
 
-        /* ── Progress bar ── */
         .progress-wrap { margin-top: 14px; }
         .progress-outer {
             width: 100%;
@@ -255,7 +247,6 @@
             color: var(--muted);
         }
 
-        /* ── Spinner ── */
         .spinner {
             display: inline-block;
             width: 14px;
@@ -267,7 +258,6 @@
         }
         @keyframes spin { to { transform: rotate(360deg); } }
 
-        /* ── Available badges ── */
         .found-badges {
             display: flex;
             flex-wrap: wrap;
@@ -287,7 +277,6 @@
         }
         @keyframes popIn { from { transform: scale(0.8); opacity: 0; } to { transform: scale(1); opacity: 1; } }
 
-        /* ── Toast ── */
         .toast {
             position: fixed;
             bottom: 20px;
@@ -304,7 +293,6 @@
         }
         @keyframes slideUp { from { transform: translateX(-50%) translateY(30px); opacity: 0; } }
 
-        /* ── Scrollbar ── */
         .status-box::-webkit-scrollbar { width: 5px; }
         .status-box::-webkit-scrollbar-track { background: transparent; }
         .status-box::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
@@ -323,24 +311,29 @@
     <div class="top-bar">
         <div class="badge" id="torBadge"><span class="dot offline"></span> Tor: checking...</div>
         <div class="badge views" id="viewBadge">&#x1F441; Views: 0</div>
+        <div class="badge" id="botBadge" style="display:none">&#x1F916; Bot: idle</div>
     </div>
 
     <div class="main-grid">
 
-        <!-- ── Discord checker card ── -->
+        <!-- ── Discord checker ── -->
         <div class="card">
             <h2>&#x1F50D; Username Checker</h2>
-            <p class="sub">Enter your Discord token, pick a length, and find available short usernames live.</p>
+            <p class="sub">Paste your Discord <strong>user token</strong> (from browser DevTools), then check availability.</p>
 
             <div class="input-group">
-                <label>Discord Auth Token</label>
-                <input type="password" id="authToken" placeholder="Paste your Discord authorization token...">
+                <label>Discord User Token</label>
+                <div class="input-row">
+                    <input type="password" id="authToken" placeholder="Paste your Discord user token..." oninput="tokenChanged()">
+                    <button class="btn-sm btn-outline" id="btnValidate" onclick="validateToken()" disabled>Verify</button>
+                </div>
+                <div class="token-status" id="tokenStatus"></div>
             </div>
 
             <div class="btn-row">
-                <button class="btn-primary" onclick="startCheck(2)">2 Letters</button>
-                <button class="btn-primary" onclick="startCheck(3)">3 Letters</button>
-                <button class="btn-primary" onclick="startCheck(4)">4 Letters</button>
+                <button class="btn-primary" id="btn2" onclick="startCheck(2)" disabled>2 Letters (676)</button>
+                <button class="btn-primary" id="btn3" onclick="startCheck(3)" disabled>3 Letters (17k)</button>
+                <button class="btn-primary" id="btn4" onclick="startCheck(4)" disabled>4 Letters (456k)</button>
                 <button class="btn-outline" id="btnStop" onclick="stopCheck()" disabled>Stop</button>
             </div>
 
@@ -350,14 +343,13 @@
             </div>
 
             <div class="found-badges" id="foundBadges"></div>
-
             <div class="status-box" id="discordLog"></div>
         </div>
 
-        <!-- ── guns.lol card ── -->
+        <!-- ── guns.lol ── -->
         <div class="card">
             <h2>&#x1F4C8; guns.lol View Bot</h2>
-            <p class="sub">Rotating-proxy view bot. Uses Chrome headless with proxy rotation &amp; cache clearing. Falls back to requests if Chrome unavailable.</p>
+            <p class="sub">Sends views to any URL. Uses Chrome if available, falls back to lightweight HTTP requests. Views increment in real-time.</p>
 
             <div class="input-group">
                 <label>Target URL</label>
@@ -365,7 +357,7 @@
             </div>
 
             <div class="input-group">
-                <label>Number of browsers</label>
+                <label>Bots</label>
                 <input type="text" id="browserCount" placeholder="3" value="3" style="width:80px;">
             </div>
 
@@ -379,10 +371,12 @@
     <script>
         let abortController = null;
         let checking = false;
+        let tokenValid = false;
         let foundUsernames = [];
         let viewInterval = null;
+        let botInterval = null;
 
-        // ── init: check server status ──
+        // ── init ──
         (async function init() {
             try {
                 const r = await fetch('/status');
@@ -392,16 +386,16 @@
                 updateTorBadge(false, 0);
             }
             viewInterval = setInterval(updateViews, 2500);
+            botInterval = setInterval(updateBotStatus, 3000);
             updateViews();
+            updateBotStatus();
         })();
 
         function updateTorBadge(available, count) {
             const b = document.getElementById('torBadge');
-            if (available) {
-                b.innerHTML = `<span class="dot online"></span> Tor: ${count} circuits`;
-            } else {
-                b.innerHTML = `<span class="dot offline"></span> Tor: unavailable (direct)`;
-            }
+            b.innerHTML = available
+                ? `<span class="dot online"></span> Tor: ${count} circuits`
+                : `<span class="dot offline"></span> Tor: unavailable (direct)`;
         }
 
         async function updateViews() {
@@ -412,13 +406,82 @@
             } catch (e) {}
         }
 
+        async function updateBotStatus() {
+            try {
+                const r = await fetch('/bot_status');
+                const s = await r.json();
+                const badge = document.getElementById('botBadge');
+                if (s.running) {
+                    badge.style.display = 'flex';
+                    badge.innerHTML = `&#x1F916; Bot: ${s.mode} &middot; ${s.browser_count} workers`;
+                } else {
+                    badge.style.display = 'none';
+                }
+            } catch (e) {}
+        }
+
+        // ── Token validation ──
+        function tokenChanged() {
+            tokenValid = false;
+            const inp = document.getElementById('authToken');
+            const btn = document.getElementById('btnValidate');
+            const st = document.getElementById('tokenStatus');
+            inp.classList.remove('valid', 'invalid');
+            st.textContent = '';
+            st.className = 'token-status';
+            btn.disabled = !inp.value.trim();
+            document.querySelectorAll('#btn2, #btn3, #btn4').forEach(b => b.disabled = true);
+        }
+
+        async function validateToken() {
+            const inp = document.getElementById('authToken');
+            const st = document.getElementById('tokenStatus');
+            const token = inp.value.trim();
+            if (!token) return;
+
+            st.innerHTML = '<span class="spinner"></span> Checking...';
+            st.className = 'token-status';
+            inp.classList.remove('valid', 'invalid');
+
+            try {
+                const r = await fetch('/validate_token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ auth_token: token }),
+                });
+                const d = await r.json();
+                if (d.valid) {
+                    st.innerHTML = `&#x2705; Valid! Logged in as <strong>${d.username}</strong>`;
+                    st.className = 'token-status ok';
+                    inp.classList.add('valid');
+                    tokenValid = true;
+                    document.querySelectorAll('#btn2, #btn3, #btn4').forEach(b => b.disabled = false);
+                } else {
+                    st.innerHTML = `&#x274C; ${d.error}`;
+                    st.className = 'token-status bad';
+                    inp.classList.add('invalid');
+                    tokenValid = false;
+                }
+            } catch (e) {
+                st.innerHTML = `&#x274C; Could not reach server`;
+                st.className = 'token-status bad';
+            }
+        }
+
+        // Allow pressing Enter on token field to validate
+        document.getElementById('authToken').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') validateToken();
+        });
+
         // ── Username checker ──
         async function startCheck(length) {
             if (checking) return;
+            if (!tokenValid) {
+                toast('Validate your token first by clicking "Verify".');
+                return;
+            }
 
             const token = document.getElementById('authToken').value.trim();
-            if (!token) return toast('Please enter your Discord auth token first.');
-
             checking = true;
             foundUsernames = [];
             abortController = new AbortController();
@@ -435,6 +498,7 @@
             progressBar.style.width = '0%';
             foundCountEl.textContent = 'Found: 0';
             btnStop.disabled = false;
+            document.querySelectorAll('#btn2, #btn3, #btn4').forEach(b => b.disabled = true);
 
             logEntry(log, `Starting ${length}-letter check...`, 'progress');
 
@@ -445,6 +509,12 @@
                     body: JSON.stringify({ length, auth_token: token, use_proxy: true }),
                     signal: abortController.signal,
                 });
+
+                if (!resp.ok) {
+                    const err = await resp.json();
+                    logEntry(log, `&#x274C; ${err.error}`, 'error');
+                    return;
+                }
 
                 const reader = resp.body.getReader();
                 const decoder = new TextDecoder();
@@ -462,7 +532,7 @@
                         if (!line.startsWith('data: ')) continue;
                         try {
                             const event = JSON.parse(line.slice(6));
-                            handleSSEEvent(event, length, log, progressBar, progressText, foundCountEl, badges);
+                            handleEvent(event, log, progressBar, progressText, foundCountEl, badges);
                         } catch (e) {}
                     }
                 }
@@ -474,49 +544,54 @@
                 checking = false;
                 btnStop.disabled = true;
                 abortController = null;
+                if (tokenValid) {
+                    document.querySelectorAll('#btn2, #btn3, #btn4').forEach(b => b.disabled = false);
+                }
             }
         }
 
-        function handleSSEEvent(event, length, log, progressBar, progressText, foundCountEl, badges) {
+        function handleEvent(event, log, bar, ptext, fcount, badges) {
+            const pct = event.total ? (event.checked / event.total * 100).toFixed(1) : 0;
+            bar.style.width = `${pct}%`;
+            ptext.textContent = event.total ? `${event.checked.toLocaleString()} / ${event.total.toLocaleString()}` : '';
+
             switch (event.event) {
                 case 'found':
                     foundUsernames.push(event.username);
                     logEntry(log, `&#x2705; ${event.username} — AVAILABLE`, 'found');
-                    foundCountEl.textContent = `Found: ${foundUsernames.length}`;
-                    const badge = document.createElement('span');
-                    badge.className = 'found-badge';
-                    badge.textContent = event.username;
-                    badges.appendChild(badge);
-                    progressBar.style.width = `${(event.checked / event.total * 100).toFixed(1)}%`;
-                    progressText.textContent = `${event.checked.toLocaleString()} / ${event.total.toLocaleString()}`;
+                    fcount.textContent = `Found: ${foundUsernames.length}`;
+                    const b = document.createElement('span');
+                    b.className = 'found-badge';
+                    b.textContent = event.username;
+                    badges.appendChild(b);
                     break;
 
                 case 'progress':
-                    progressBar.style.width = `${(event.checked / event.total * 100).toFixed(1)}%`;
-                    progressText.textContent = `${event.checked.toLocaleString()} / ${event.total.toLocaleString()}`;
                     break;
 
-                case 'error':
-                    logEntry(log, `&#x274C; ${event.message}`, 'error');
+                case 'fatal':
+                    logEntry(log, `&#x274C; FATAL — ${event.message}`, 'error');
+                    if (event.status === 401) {
+                        logEntry(log, '&#x26A0;&#xFE0F; Your token was rejected. Get a fresh user token from Discord browser DevTools (Network tab &rarr; look for "authorization" header).', 'warn');
+                    }
+                    if (event.status === 429) {
+                        logEntry(log, '&#x26A0;&#xFE0F; Rate limited. Wait a few minutes and try again with fewer workers.', 'warn');
+                    }
                     break;
 
                 case 'complete':
-                    progressBar.style.width = '100%';
-                    progressText.textContent = `${event.checked.toLocaleString()} / ${event.total.toLocaleString()}`;
+                    bar.style.width = '100%';
                     if (event.available.length === 0) {
-                        logEntry(log, `Done — no available ${length}-letter usernames found.`, 'progress');
+                        logEntry(log, 'Done — no available usernames found.', 'progress');
                     } else {
-                        logEntry(log, `Done! Found ${event.available.length} available username(s).`, 'progress');
+                        logEntry(log, `Done! Found ${event.available.length} available.`, 'progress');
                     }
                     break;
             }
         }
 
         function stopCheck() {
-            if (abortController) {
-                abortController.abort();
-                abortController = null;
-            }
+            if (abortController) { abortController.abort(); abortController = null; }
             checking = false;
             document.getElementById('btnStop').disabled = true;
             logEntry(document.getElementById('discordLog'), 'Stopped by user.', 'progress');
@@ -539,7 +614,7 @@
             if (!url) return toast('Please enter a target URL.');
 
             log.innerHTML = '';
-            logEntry(log, `Starting ${browsers} browser bot(s) targeting ${url}...`, 'progress');
+            logEntry(log, `Starting ${browsers} bot(s) for ${url}...`, 'progress');
 
             try {
                 const resp = await fetch('/start_guns_lol', {
@@ -551,10 +626,12 @@
                 if (data.error) {
                     logEntry(log, `&#x274C; ${data.error}`, 'error');
                 } else {
-                    logEntry(log, `&#x2705; Bot started with ${data.browsers} browser(s). Views incrementing...`, 'found');
+                    logEntry(log, `&#x2705; Bot started with ${data.browsers} worker(s).`, 'found');
+                    logEntry(log, 'Check the badge above for live status &mdash; views increment every few seconds.', 'progress');
+                    updateBotStatus();
                 }
             } catch (e) {
-                logEntry(log, `&#x274C; Error: ${e.message}`, 'error');
+                logEntry(log, `&#x274C; ${e.message}`, 'error');
             }
         }
 
