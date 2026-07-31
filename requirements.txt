@@ -4,3 +4,4 @@ requests==2.31.0
 pysocks==1.7.1
 undetected-chromedriver==3.5.3
 selenium==4.15.2
+playwright>=1.40,<2

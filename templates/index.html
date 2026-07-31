@@ -138,7 +138,8 @@
         .input-row input { flex: 1; }
         input[type="text"],
         input[type="url"],
-        input[type="password"] {
+        input[type="password"],
+        textarea {
             width: 100%;
             padding: 11px 14px;
             background: var(--surface2);
@@ -150,7 +151,8 @@
             transition: var(--transition);
             outline: none;
         }
-        input:focus { border-color: var(--discord); box-shadow: 0 0 0 3px rgba(88,101,242,0.15); }
+        textarea { resize: vertical; min-height: 72px; font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 0.85em; }
+        input:focus, textarea:focus { border-color: var(--discord); box-shadow: 0 0 0 3px rgba(88,101,242,0.15); }
         input.valid { border-color: var(--green) !important; }
         input.invalid { border-color: var(--red) !important; }
 
@@ -203,7 +205,7 @@
             margin-top: 16px;
             border: 1px solid var(--border);
             min-height: 120px;
-            max-height: 420px;
+            max-height: 380px;
             overflow-y: auto;
             font-family: 'JetBrains Mono', 'Fira Code', monospace;
             font-size: 0.82em;
@@ -219,7 +221,8 @@
             animation: fadeIn 0.2s ease;
         }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
-        .log-entry.found { color: var(--green); }
+        .log-entry .lt { color: var(--muted); flex-shrink: 0; }
+        .log-entry.found, .log-entry.ok { color: var(--green); }
         .log-entry.error { color: var(--red); }
         .log-entry.warn { color: var(--gold); }
         .log-entry.progress { color: var(--muted); }
@@ -296,6 +299,62 @@
         .status-box::-webkit-scrollbar { width: 5px; }
         .status-box::-webkit-scrollbar-track { background: transparent; }
         .status-box::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+        /* ── Bot panel ── */
+        .engine-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.78em;
+            font-weight: 600;
+            padding: 4px 12px;
+            border-radius: 20px;
+            margin-bottom: 12px;
+        }
+        .engine-badge.playwright { background: rgba(59,165,92,0.12); color: var(--green); border: 1px solid rgba(59,165,92,0.3); }
+        .engine-badge.chrome { background: rgba(88,101,242,0.12); color: #7b83f6; border: 1px solid rgba(88,101,242,0.3); }
+        .engine-badge.requests { background: rgba(250,166,26,0.12); color: var(--gold); border: 1px solid rgba(250,166,26,0.3); }
+        .engine-badge.idle { background: var(--surface2); color: var(--muted); border: 1px solid var(--border); }
+
+        .stat-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin: 12px 0;
+        }
+        .stat {
+            background: var(--surface2);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 10px 12px;
+            text-align: center;
+        }
+        .stat .num { font-size: 1.25em; font-weight: 800; }
+        .stat .lbl { font-size: 0.68em; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-top: 2px; }
+        .stat.green .num { color: var(--green); }
+        .stat.red .num { color: var(--red); }
+        .stat.blue .num { color: #7b83f6; }
+
+        .worker-list { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+        .worker-row {
+            display: grid;
+            grid-template-columns: 70px 1fr auto auto auto;
+            gap: 8px;
+            align-items: center;
+            background: var(--surface2);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 7px 10px;
+            font-size: 0.78em;
+        }
+        .worker-row .wid { font-family: monospace; color: var(--muted); }
+        .worker-row .wlast { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .worker-row .wviews { color: var(--green); font-family: monospace; font-weight: 700; }
+        .worker-row .werrors { color: var(--red); font-family: monospace; }
+        .dot.small { width: 7px; height: 7px; }
+        .wstatus.ok { color: var(--green); }
+        .wstatus.fail { color: var(--red); }
+        .wstatus.starting { color: var(--gold); }
     </style>
 </head>
 <body>
@@ -305,7 +364,7 @@
 
     <header>
         <h1>&#x1F525; Discord Username Sniper + guns.lol Bot</h1>
-        <p>Live-check 2–4 letter Discord usernames &middot; Auto view-bot for guns.lol</p>
+        <p>Live-check 2–4 letter Discord usernames &middot; Real-browser view bot for guns.lol</p>
     </header>
 
     <div class="top-bar">
@@ -349,7 +408,7 @@
         <!-- ── guns.lol ── -->
         <div class="card">
             <h2>&#x1F4C8; guns.lol View Bot</h2>
-            <p class="sub">Sends views to any URL. Uses Chrome if available, falls back to lightweight HTTP requests. Views increment in real-time.</p>
+            <p class="sub">Loads your profile in a real headless browser so views actually count. Add proxies (one per line) to rotate IPs &mdash; residential proxies work best.</p>
 
             <div class="input-group">
                 <label>Target URL</label>
@@ -357,12 +416,29 @@
             </div>
 
             <div class="input-group">
-                <label>Bots</label>
+                <label>Workers (browser instances)</label>
                 <input type="text" id="browserCount" placeholder="3" value="3" style="width:80px;">
             </div>
 
-            <button class="btn-danger" onclick="startGuns()">&#x1F680; Start Bot</button>
+            <div class="input-group">
+                <label>Proxies (optional &middot; one per line)</label>
+                <textarea id="gunsProxies" placeholder="http://user:pass@host:port&#10;socks5://host:port&#10;host:port"></textarea>
+            </div>
 
+            <div class="btn-row">
+                <button class="btn-danger" id="btnStartGuns" onclick="startGuns()">&#x1F680; Start Bot</button>
+                <button class="btn-outline" id="btnStopGuns" onclick="stopGuns()" disabled>Stop</button>
+            </div>
+
+            <div class="engine-badge idle" id="engineBadge">Engine: detecting...</div>
+
+            <div class="stat-grid">
+                <div class="stat blue"><div class="num" id="statViews">0</div><div class="lbl">Verified views</div></div>
+                <div class="stat"><div class="num" id="statAttempts">0</div><div class="lbl">Attempts</div></div>
+                <div class="stat red"><div class="num" id="statErrors">0</div><div class="lbl">Failures</div></div>
+            </div>
+
+            <div class="worker-list" id="workerList"></div>
             <div class="status-box" id="gunsLog"></div>
         </div>
 
@@ -375,6 +451,8 @@
         let foundUsernames = [];
         let viewInterval = null;
         let botInterval = null;
+        let lastLogId = 0;
+        let botRunning = false;
 
         // ── init ──
         (async function init() {
@@ -382,11 +460,12 @@
                 const r = await fetch('/status');
                 const s = await r.json();
                 updateTorBadge(s.tor_available, s.tor_instances);
+                updateEngineBadge(s.engine);
             } catch (e) {
                 updateTorBadge(false, 0);
             }
             viewInterval = setInterval(updateViews, 2500);
-            botInterval = setInterval(updateBotStatus, 3000);
+            botInterval = setInterval(updateBotStatus, 2000);
             updateViews();
             updateBotStatus();
         })();
@@ -396,6 +475,13 @@
             b.innerHTML = available
                 ? `<span class="dot online"></span> Tor: ${count} circuits`
                 : `<span class="dot offline"></span> Tor: unavailable (direct)`;
+        }
+
+        function updateEngineBadge(engine) {
+            const b = document.getElementById('engineBadge');
+            const names = { playwright: 'Real browser (Playwright)', chrome: 'Real browser (Chrome)', requests: 'Raw HTTP fallback', idle: 'Engine: detecting...' };
+            b.className = `engine-badge ${engine || 'idle'}`;
+            b.textContent = names[engine] || `Engine: ${engine}`;
         }
 
         async function updateViews() {
@@ -410,14 +496,63 @@
             try {
                 const r = await fetch('/bot_status');
                 const s = await r.json();
+                botRunning = s.running;
+
                 const badge = document.getElementById('botBadge');
                 if (s.running) {
                     badge.style.display = 'flex';
-                    badge.innerHTML = `&#x1F916; Bot: ${s.mode} &middot; ${s.browser_count} workers`;
+                    badge.innerHTML = `&#x1F916; Bot: ${s.engine} &middot; ${s.browser_count} workers &middot; ${s.views_sent} views`;
                 } else {
                     badge.style.display = 'none';
                 }
+
+                updateEngineBadge(s.engine);
+                document.getElementById('statViews').textContent = s.views_sent;
+                document.getElementById('statAttempts').textContent = s.attempts;
+                document.getElementById('statErrors').textContent = s.errors;
+
+                document.getElementById('btnStartGuns').disabled = s.running;
+                document.getElementById('btnStopGuns').disabled = !s.running;
+
+                renderWorkers(s.workers);
+                appendLogs(s.logs || []);
             } catch (e) {}
+        }
+
+        function renderWorkers(workers) {
+            const list = document.getElementById('workerList');
+            if (!workers || Object.keys(workers).length === 0) { list.innerHTML = ''; return; }
+            const keys = Object.keys(workers).sort((a, b) => parseInt(a) - parseInt(b));
+            list.innerHTML = keys.map(id => {
+                const w = workers[id];
+                return `<div class="worker-row">
+                    <span class="wid">W${parseInt(id) + 1}</span>
+                    <span class="wlast">${w.last || '—'}</span>
+                    <span class="wviews">${w.views} views</span>
+                    <span class="werrors">${w.errors} err</span>
+                    <span class="wstatus ${w.status}">${w.status}</span>
+                </div>`;
+            }).join('');
+        }
+
+        function appendLogs(logs) {
+            const box = document.getElementById('gunsLog');
+            const fresh = logs.filter(l => l.id > lastLogId);
+            for (const l of fresh) {
+                const div = document.createElement('div');
+                div.className = `log-entry ${l.level}`;
+                div.innerHTML = `<span class="lt">${l.t}</span> ${escapeHtml(l.msg)}`;
+                box.appendChild(div);
+                lastLogId = l.id;
+            }
+            if (fresh.length && box.children.length > 200) {
+                while (box.children.length > 200) box.removeChild(box.firstChild);
+            }
+            if (fresh.length) box.scrollTop = box.scrollHeight;
+        }
+
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
         }
 
         // ── Token validation ──
@@ -468,7 +603,6 @@
             }
         }
 
-        // Allow pressing Enter on token field to validate
         document.getElementById('authToken').addEventListener('keydown', function(e) {
             if (e.key === 'Enter') validateToken();
         });
@@ -609,30 +743,39 @@
         async function startGuns() {
             const url = document.getElementById('gunsUrl').value.trim();
             const browsers = parseInt(document.getElementById('browserCount').value) || 3;
+            const proxies = document.getElementById('gunsProxies').value.trim();
             const log = document.getElementById('gunsLog');
 
             if (!url) return toast('Please enter a target URL.');
 
+            lastLogId = 0;
             log.innerHTML = '';
-            logEntry(log, `Starting ${browsers} bot(s) for ${url}...`, 'progress');
 
             try {
                 const resp = await fetch('/start_guns_lol', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ url, browsers }),
+                    body: JSON.stringify({ url, browsers, proxies }),
                 });
                 const data = await resp.json();
                 if (data.error) {
-                    logEntry(log, `&#x274C; ${data.error}`, 'error');
+                    toast(`Error: ${data.error}`);
                 } else {
-                    logEntry(log, `&#x2705; Bot started with ${data.browsers} worker(s).`, 'found');
-                    logEntry(log, 'Check the badge above for live status &mdash; views increment every few seconds.', 'progress');
-                    updateBotStatus();
+                    updateEngineBadge(data.engine);
+                    toast(`Bot started — ${data.engine} engine, ${data.browsers} workers, ${data.proxies} proxies`);
                 }
+                updateBotStatus();
             } catch (e) {
-                logEntry(log, `&#x274C; ${e.message}`, 'error');
+                toast(`Could not reach server: ${e.message}`);
             }
+        }
+
+        async function stopGuns() {
+            try {
+                await fetch('/stop_guns_lol', { method: 'POST' });
+                toast('Bot stopped.');
+                updateBotStatus();
+            } catch (e) {}
         }
 
         // ── Toast ──

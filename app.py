@@ -7,8 +7,8 @@ import os
 import time
 import json
 import threading
-import socks
-import socket
+import re
+from collections import deque
 from flask import Flask, render_template, jsonify, request, Response, stream_with_context
 from flask_cors import CORS
 import queue
@@ -16,6 +16,7 @@ import queue
 app = Flask(__name__)
 CORS(app)
 
+# Default proxy pool (local Tor instances) — replaced by user proxies when provided
 PROXY_POOL = [
     "socks5://127.0.0.1:9050",
     "socks5://127.0.0.1:9051",
@@ -27,13 +28,51 @@ PROXY_POOL = [
 TOR_INSTANCES = []
 VIEW_COUNT = 0
 VIEW_LOCK = threading.Lock()
-SOCKET_LOCK = threading.Lock()
 TOR_AVAILABLE = False
 
-# shared state so frontend can poll bot status
-BOT_STATE = {"running": False, "browser_count": 0, "mode": "idle", "errors": 0}
+# ── Bot state (shared, thread-safe) ────────────────────────────────────
 BOT_LOCK = threading.Lock()
+BOT_STOP = threading.Event()
+BOT_LOG_ID = [0]
+BOT_LOGS = deque(maxlen=300)
+BOT_STATE = {
+    "running": False,
+    "browser_count": 0,
+    "engine": "idle",          # playwright | chrome | requests
+    "views_sent": 0,           # verified real page loads
+    "attempts": 0,
+    "errors": 0,
+    "started_at": None,
+    "workers": {},             # id -> {status, views, errors, last, last_at}
+}
 
+# ── Global request pacing (Discord checker) ────────────────────────────
+PACE_LOCK = threading.Lock()
+PACE_LAST = [0.0]
+
+
+def pace_requests(min_interval=0.4):
+    """Throttle aggregate request rate across all checker workers."""
+    with PACE_LOCK:
+        now = time.time()
+        wait = min_interval - (now - PACE_LAST[0])
+        if wait > 0:
+            time.sleep(wait)
+        PACE_LAST[0] = time.time()
+
+
+def bot_log(level, msg):
+    with BOT_LOCK:
+        BOT_LOG_ID[0] += 1
+        BOT_LOGS.append({
+            "id": BOT_LOG_ID[0],
+            "t": time.strftime("%H:%M:%S"),
+            "level": level,
+            "msg": msg,
+        })
+
+
+# ── Tor ────────────────────────────────────────────────────────────────
 
 def start_tor_instances():
     global TOR_AVAILABLE
@@ -64,34 +103,25 @@ def start_tor_instances():
 
 
 def rotate_proxy(proxy_url):
-    if not TOR_AVAILABLE:
+    if not TOR_AVAILABLE or "127.0.0.1" not in proxy_url:
         return
     try:
         port = int(proxy_url.split(":")[-1])
-        s = socket.socket()
-        s.settimeout(5)
-        s.connect(("127.0.0.1", port + 10000))
-        s.send(b'AUTHENTICATE ""\r\nSIGNAL NEWNYM\r\nQUIT\r\n')
-        s.close()
-        time.sleep(1.5)
+        s = socket_connect((port + 10000))
     except Exception:
         pass
 
 
-def _make_socks_request(method, url, headers, json_data, proxy_url, timeout):
-    host = proxy_url.replace("socks5://", "").split(":")[0]
-    port = int(proxy_url.replace("socks5://", "").split(":")[1])
-    with SOCKET_LOCK:
-        old_socket = socket.socket
-        socks.set_default_proxy(socks.SOCKS5, host, port)
-        socket.socket = socks.socksocket
-    try:
-        resp = requests.request(method, url, headers=headers, json=json_data, timeout=timeout)
-    finally:
-        with SOCKET_LOCK:
-            socket.socket = old_socket
-    return resp
+def socket_connect(control_port):
+    import socket
+    s = socket.socket()
+    s.settimeout(5)
+    s.connect(("127.0.0.1", control_port))
+    s.send(b'AUTHENTICATE ""\r\nSIGNAL NEWNYM\r\nQUIT\r\n')
+    s.close()
 
+
+# ── Discord checker ────────────────────────────────────────────────────
 
 def _build_discord_headers(auth_token):
     return {
@@ -130,7 +160,11 @@ def check_discord_username(username, auth_token, proxy_url=None, use_proxy=True)
 
     def _do(s):
         if s == "proxy":
-            return _make_socks_request("POST", "https://discord.com/api/v9/users/@me/pomelo", headers, payload, proxy_url, 10)
+            return requests.post(
+                "https://discord.com/api/v9/users/@me/pomelo",
+                headers=headers, json=payload, timeout=10,
+                proxies={"http": proxy_url, "https": proxy_url},
+            )
         return requests.post("https://discord.com/api/v9/users/@me/pomelo", headers=headers, json=payload, timeout=10)
 
     strategies = []
@@ -166,8 +200,20 @@ def check_discord_username(username, auth_token, proxy_url=None, use_proxy=True)
     return {"available": None, "status": None, "discord_msg": "All connection attempts failed"}
 
 
+# ── guns.lol view bot engine ───────────────────────────────────────────
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+]
+
+CHALLENGE_MARKERS = ["just a moment", "cf-challenge", "checking your browser", "attention required", "cloudflare"]
+
+
 def _chrome_available():
-    """Check if Chrome/chromium binary actually exists on the system."""
     for name in ["google-chrome", "chromium", "chromium-browser", "google-chrome-stable"]:
         try:
             subprocess.run([name, "--version"], capture_output=True, timeout=5, check=True)
@@ -177,85 +223,164 @@ def _chrome_available():
     return False
 
 
-def guns_lol_bot(target_url, proxy_url, browser_id):
-    global VIEW_COUNT
-
-    chrome_ok = False
+def _playwright_browser_ready():
+    """True when playwright is installed AND a chromium browser was downloaded."""
     try:
-        import undetected_chromedriver as uc  # noqa: F811
-        from selenium.webdriver.chrome.options import Options
-        chrome_ok = _chrome_available()
+        import playwright  # noqa: F401
     except ImportError:
-        pass
+        return False
+    candidates = [
+        os.environ.get("PLAYWRIGHT_BROWSERS_PATH"),
+        os.path.expanduser("~/.cache/ms-playwright"),
+    ]
+    for base in candidates:
+        if base and os.path.isdir(base):
+            for d in os.listdir(base):
+                if "chromium" in d:
+                    return True
+    return False
 
-    mode = "selenium" if chrome_ok else "requests"
-    print(f"[bot {browser_id}] mode={mode} target={target_url}")
 
-    with BOT_LOCK:
-        BOT_STATE["mode"] = mode
+def detect_engine():
+    if _playwright_browser_ready():
+        return "playwright"
+    if _chrome_available():
+        return "chrome"
+    return "requests"
 
-    while True:
-        driver = None
+
+def _send_playwright_view(target_url, proxy_url):
+    from playwright.sync_api import sync_playwright
+    ua = random.choice(USER_AGENTS)
+    viewport = random.choice([(1366, 768), (1440, 900), (1536, 864), (1920, 1080), (1280, 720)])
+    launch_opts = {
+        "headless": True,
+        "args": [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-blink-features=AutomationControlled",
+            "--lang=en-US",
+        ],
+    }
+    if proxy_url:
+        launch_opts["proxy"] = {"server": proxy_url}
+    with sync_playwright() as p:
+        browser = p.chromium.launch(**launch_opts)
         try:
-            if chrome_ok:
-                host = proxy_url.replace("socks5://", "").split(":")[0]
-                port = int(proxy_url.replace("socks5://", "").split(":")[1])
-                opts = Options()
-                opts.add_argument(f"--proxy-server=socks5://{host}:{port}")
-                opts.add_argument("--headless=new")
-                opts.add_argument("--no-sandbox")
-                opts.add_argument("--disable-dev-shm-usage")
-                opts.add_argument("--disable-gpu")
-                opts.add_argument("--disable-blink-features=AutomationControlled")
-                opts.add_argument("--window-size=1920,1080")
-                opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                opts.add_argument("--incognito")
-                opts.add_experimental_option("prefs", {"disk_cache_size": 0})
+            context = browser.new_context(
+                user_agent=ua,
+                viewport={"width": viewport[0], "height": viewport[1]},
+                locale="en-US",
+                timezone_id=random.choice(["America/New_York", "Europe/London", "Asia/Tokyo", "Australia/Sydney"]),
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9", "Referer": "https://www.google.com/"},
+            )
+            page = context.new_page()
+            t0 = time.time()
+            resp = page.goto(target_url, timeout=30000, wait_until="domcontentloaded")
+            # human-ish behavior: scroll, dwell
+            page.wait_for_timeout(random.randint(2500, 6000))
+            for _ in range(random.randint(1, 3)):
+                page.mouse.wheel(0, random.randint(200, 800))
+                page.wait_for_timeout(random.randint(400, 1200))
+            title = (page.title() or "").lower()
+            status = resp.status if resp else None
+            if status and status >= 400:
+                return False, f"HTTP {status} from server"
+            if any(m in title for m in CHALLENGE_MARKERS):
+                return False, "Blocked by challenge/Cloudflare"
+            context.close()
+            return True, f"HTTP {status or 200} · {time.time()-t0:.1f}s · real browser"
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
 
-                driver = uc.Chrome(options=opts)
-                driver.set_page_load_timeout(30)
-                driver.get(target_url)
-                time.sleep(random.uniform(3, 7))
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight / 2);")
-                time.sleep(random.uniform(1, 3))
 
-                with VIEW_LOCK:
-                    VIEW_COUNT += 1
+def _send_chrome_view(target_url, proxy_url):
+    import undetected_chromedriver as uc
+    from selenium.webdriver.chrome.options import Options
+    opts = Options()
+    if proxy_url:
+        opts.add_argument(f"--proxy-server={proxy_url}")
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument(f"--user-agent={random.choice(USER_AGENTS)}")
+    opts.add_experimental_option("prefs", {"disk_cache_size": 0})
+    driver = uc.Chrome(options=opts)
+    try:
+        driver.set_page_load_timeout(30)
+        t0 = time.time()
+        driver.get(target_url)
+        time.sleep(random.uniform(2.5, 6))
+        title = (driver.title or "").lower()
+        if any(m in title for m in CHALLENGE_MARKERS):
+            return False, "Blocked by challenge/Cloudflare"
+        return True, f"Loaded in {time.time()-t0:.1f}s · real browser"
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
-                driver.delete_all_cookies()
-                driver.execute_script("window.localStorage.clear();")
-                driver.execute_script("window.sessionStorage.clear();")
-                driver.quit()
-                driver = None
+
+def _send_requests_view(target_url, proxy_url):
+    """Last-resort fallback — raw HTTP, no JS. Often NOT counted by sites."""
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.google.com/",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    kwargs = {"headers": headers, "timeout": 15}
+    if proxy_url:
+        kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+    r = requests.get(target_url, **kwargs)
+    if r.status_code >= 400:
+        return False, f"HTTP {r.status_code} from server"
+    if len(r.content) < 500:
+        return False, "Empty response (likely blocked)"
+    return True, f"HTTP {r.status_code} · raw HTTP (no JS — may not count)"
+
+
+def guns_worker(target_url, proxies, worker_id, stop_event):
+    engine = BOT_STATE["engine"]
+    while not stop_event.is_set():
+        proxy = proxies[worker_id % len(proxies)] if proxies else None
+        try:
+            if engine == "playwright":
+                ok, detail = _send_playwright_view(target_url, proxy)
+            elif engine == "chrome":
+                ok, detail = _send_chrome_view(target_url, proxy)
             else:
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.9",
-                }
-                requests.get(target_url, headers=headers, timeout=15)
-                time.sleep(random.uniform(3, 7))
-                with VIEW_LOCK:
-                    VIEW_COUNT += 1
-                print(f"[bot {browser_id}] view #{VIEW_COUNT}")
-
-            rotate_proxy(proxy_url)
-            time.sleep(random.uniform(2, 5))
-
+                ok, detail = _send_requests_view(target_url, proxy)
         except Exception as e:
-            print(f"[bot {browser_id}] error: {e}")
-            with BOT_LOCK:
+            ok, detail = False, f"{type(e).__name__}: {str(e)[:120]}"
+
+        with BOT_LOCK:
+            BOT_STATE["attempts"] += 1
+            w = BOT_STATE["workers"].setdefault(str(worker_id), {"status": "started", "views": 0, "errors": 0, "last": "—", "last_at": None})
+            if ok:
+                BOT_STATE["views_sent"] += 1
+                w["views"] += 1
+                w["status"] = "ok"
+            else:
                 BOT_STATE["errors"] += 1
-            if driver is not None:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-                driver = None
-            time.sleep(5)
+                w["errors"] += 1
+                w["status"] = "fail"
+            w["last"] = detail
+            w["last_at"] = time.strftime("%H:%M:%S")
+        bot_log("ok" if ok else "error", f"worker {worker_id+1} · {detail}")
+        time.sleep(random.uniform(3, 8))
 
 
-# ── Routes ──────────────────────────────────────────────────────────────
+# ── Routes ─────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -264,7 +389,6 @@ def index():
 
 @app.route("/validate_token", methods=["POST"])
 def validate_token():
-    """Quick check: does this Discord token work?"""
     data = request.get_json(silent=True) or {}
     token = (data.get("auth_token") or "").strip()
     if not token:
@@ -324,6 +448,7 @@ def check_usernames():
         for combo in combo_batch:
             if stop_event.is_set():
                 return
+            pace_requests(min_interval=0.4)  # aggregate rate cap (~2.5 req/s)
             res = check_discord_username(combo, auth_token, proxy_url, use_proxy)
             checked_count[0] += 1
 
@@ -331,14 +456,10 @@ def check_usernames():
                 available_list.append(combo)
                 result_queue.put({"type": "found", "username": combo})
             elif res["status"] is not None and res["status"] >= 400:
-                # got an HTTP error from Discord
                 fatal_error[0] = res["discord_msg"]
                 result_queue.put({"type": "fatal", "message": res["discord_msg"], "status": res["status"]})
                 stop_event.set()
                 return
-
-            if not (use_proxy and TOR_AVAILABLE):
-                time.sleep(0.15)
         result_queue.put({"type": "done"})
 
     num_workers = min(5, len(combinations))
@@ -379,39 +500,85 @@ def check_usernames():
     )
 
 
+def _normalize_proxies(raw):
+    proxies = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "://" not in line:
+            line = "http://" + line  # assume http when scheme omitted
+        if not re.match(r"^(https?|socks5h?|socks4)://", line):
+            continue
+        if line not in proxies:
+            proxies.append(line)
+    return proxies
+
+
 @app.route("/start_guns_lol", methods=["POST"])
 def start_guns_lol():
+    global BOT_STATE
     data = request.get_json(silent=True) or {}
     target = (data.get("url") or "").strip()
     if not target:
         return jsonify({"error": "no url provided"}), 400
+    if not target.startswith(("http://", "https://")):
+        return jsonify({"error": "URL must start with http:// or https://"}), 400
 
-    num_browsers = int(data.get("browsers", 3))
-    num_browsers = max(1, min(num_browsers, 5))
+    num_browsers = max(1, min(int(data.get("browsers", 3)), 8))
+    proxies = _normalize_proxies(data.get("proxies"))
+    if not proxies:
+        proxies = list(PROXY_POOL) if TOR_AVAILABLE else []
+        if not proxies:
+            bot_log("warn", "No proxies configured — using direct connection (one IP).")
 
+    engine = detect_engine()
+
+    BOT_STOP.clear()
     with BOT_LOCK:
-        BOT_STATE["running"] = True
-        BOT_STATE["browser_count"] = num_browsers
-        BOT_STATE["errors"] = 0
+        BOT_STATE = {
+            "running": True,
+            "browser_count": num_browsers,
+            "engine": engine,
+            "views_sent": 0,
+            "attempts": 0,
+            "errors": 0,
+            "started_at": time.strftime("%H:%M:%S"),
+            "workers": {str(i): {"status": "starting", "views": 0, "errors": 0, "last": "—", "last_at": None} for i in range(num_browsers)},
+        }
+
+    bot_log("info", f"Starting {num_browsers} worker(s) · engine={engine} · proxies={len(proxies)}")
+    if engine == "requests":
+        bot_log("warn", "No browser found (Playwright/Chrome missing). Falling back to raw HTTP — many sites won't count these views.")
 
     for i in range(num_browsers):
-        proxy = PROXY_POOL[i]
-        t = threading.Thread(target=guns_lol_bot, args=(target, proxy, i), daemon=True)
+        t = threading.Thread(target=guns_worker, args=(target, proxies, i, BOT_STOP), daemon=True)
         t.start()
 
-    return jsonify({"status": "started", "browsers": num_browsers})
+    return jsonify({"status": "started", "browsers": num_browsers, "engine": engine, "proxies": len(proxies)})
+
+
+@app.route("/stop_guns_lol", methods=["POST"])
+def stop_guns_lol():
+    BOT_STOP.set()
+    with BOT_LOCK:
+        BOT_STATE["running"] = False
+    bot_log("info", "Bot stopped by user.")
+    return jsonify({"status": "stopped"})
 
 
 @app.route("/bot_status")
 def bot_status():
     with BOT_LOCK:
-        return jsonify(dict(BOT_STATE))
+        state = dict(BOT_STATE)
+        state["logs"] = list(BOT_LOGS)[-80:]
+        return jsonify(state)
 
 
 @app.route("/view_count")
 def view_count():
     with VIEW_LOCK:
-        return jsonify({"views": VIEW_COUNT})
+        return jsonify({"views": BOT_STATE.get("views_sent", 0)})
 
 
 @app.route("/status")
@@ -419,7 +586,8 @@ def status():
     return jsonify({
         "tor_available": TOR_AVAILABLE,
         "tor_instances": len(TOR_INSTANCES),
-        "views": VIEW_COUNT,
+        "engine": detect_engine(),
+        "views": BOT_STATE.get("views_sent", 0),
     })
 
 
