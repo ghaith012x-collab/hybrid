@@ -63,6 +63,22 @@ def pace_requests(min_interval=0.4):
         PACE_LAST[0] = time.time()
 
 
+# ── Single-IP direct mode pacing (don't burst-trigger the target's rate limiter) ──
+SINGLE_IP_LOCK = threading.Lock()
+SINGLE_IP_LAST = [0.0]
+
+
+def pace_single_ip(min_interval=6.0):
+    """Throttle aggregate views when running direct on ONE IP so the target's
+    rate limiter doesn't gate the IP after a short burst."""
+    with SINGLE_IP_LOCK:
+        now = time.time()
+        wait = min_interval - (now - SINGLE_IP_LAST[0])
+        if wait > 0:
+            time.sleep(wait)
+        SINGLE_IP_LAST[0] = time.time()
+
+
 def bot_log(level, msg):
     with BOT_LOCK:
         BOT_LOG_ID[0] += 1
@@ -621,6 +637,10 @@ def _send_playwright_view(target_url, proxy_url):
                     body = ""
                 if "403" in str(status) and any(m in body for m in ("cloudflare", "cf-", "access denied", "error 1009", "temporary block", "forbidden", "just a moment", "please wait a moment")):
                     return False, "Blocked (HTTP 403 — challenge/IP flagged)"
+                if status == 401:
+                    if any(m in body for m in ("captcha", "verify", "human", "suspended", "rate limit", "too many")):
+                        return False, "HTTP 401 — IP gated (captcha/rate-limit)"
+                    return False, "HTTP 401 — IP gated (rate-limited)"
                 return False, f"HTTP {status} from server"
             # Cloudflare interstitial ("Just a moment…") — wait for it to auto-clear before failing.
             if any(m in title for m in CHALLENGE_MARKERS):
@@ -742,6 +762,7 @@ def guns_worker(target_url, proxies, worker_id, stop_event):
     consecutive_fails = 0
     tor_403_streak = 0
     tor_block_warned = False
+    rate_limit_streak = 0
 
     while not stop_event.is_set():
         # Re-derive the verified engine every round so an engine that just finished
@@ -768,6 +789,11 @@ def guns_worker(target_url, proxies, worker_id, stop_event):
             proxy = f"socks5h://127.0.0.1:{9050 + tor_idx}"
             # Before every attempt, rotate the circuit so each view comes from a fresh exit IP.
             rotate_tor_circuit(tor_idx, verify_ip=False)
+
+        # Single-IP direct mode: pace globally so a swarm of workers on one IP
+        # doesn't burst-trigger the target's rate limiter and get gated.
+        if not use_tor and not proxies:
+            pace_single_ip(6.0)
 
         ok, detail = None, None
         max_retries = 3 if use_tor else 2
@@ -815,6 +841,7 @@ def guns_worker(target_url, proxies, worker_id, stop_event):
                 w["views"] += 1
                 w["status"] = "ok"
                 consecutive_fails = 0
+                rate_limit_streak = 0
                 if use_tor:
                     tor_403_streak = 0
                     BOT_STATE["tor_blocked"] = False
@@ -823,6 +850,10 @@ def guns_worker(target_url, proxies, worker_id, stop_event):
                 w["errors"] += 1
                 w["status"] = "fail"
                 consecutive_fails += 1
+                if "401" in (detail or ""):
+                    rate_limit_streak += 1
+                else:
+                    rate_limit_streak = max(0, rate_limit_streak - 1)
                 if use_tor and "403" in (detail or ""):
                     tor_403_streak += 1
                 elif not use_tor:
@@ -837,7 +868,11 @@ def guns_worker(target_url, proxies, worker_id, stop_event):
         bot_log("ok" if ok else "error", f"worker {worker_id+1} · {detail}")
 
         # Back off harder after repeated failures (dead circuit / blocked IP).
-        if consecutive_fails >= 3:
+        if rate_limit_streak >= 2:
+            if rate_limit_streak == 2:
+                bot_log("warn", f"worker {worker_id+1} · Target is gating this IP (HTTP 401) — backing off 45–90s so the limit resets. Proxies give you many IPs to bypass this.")
+            time.sleep(random.uniform(45, 90))
+        elif consecutive_fails >= 3:
             time.sleep(random.uniform(10, 20))
             if use_tor:
                 rotate_tor_circuit(tor_idx, verify_ip=True)
