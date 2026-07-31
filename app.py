@@ -331,7 +331,7 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
 ]
 
-CHALLENGE_MARKERS = ["just a moment", "cf-challenge", "checking your browser", "attention required", "cloudflare"]
+CHALLENGE_MARKERS = ["just a moment", "cf-challenge", "checking your browser", "attention required", "cloudflare", "please wait a moment"]
 
 
 def _chrome_available():
@@ -586,8 +586,25 @@ def _send_playwright_view(target_url, proxy_url):
             title = (page.title() or "").lower()
             status = resp.status if resp else None
             if status and status >= 400:
+                # Enrich the reason so logs are actionable (Cloudflare/IP block vs plain error).
+                try:
+                    body = (page.content() or "")[:4000].lower()
+                except Exception:
+                    body = ""
+                if "403" in str(status) and any(m in body for m in ("cloudflare", "cf-", "access denied", "error 1009", "temporary block", "forbidden", "just a moment", "please wait a moment")):
+                    return False, "Blocked (HTTP 403 — challenge/IP flagged)"
                 return False, f"HTTP {status} from server"
+            # Cloudflare interstitial ("Just a moment…") — wait for it to auto-clear before failing.
             if any(m in title for m in CHALLENGE_MARKERS):
+                deadline = time.time() + 15
+                while time.time() < deadline:
+                    page.wait_for_timeout(1500)
+                    try:
+                        new_title = (page.title() or "").lower()
+                    except Exception:
+                        new_title = ""
+                    if not any(m in new_title for m in CHALLENGE_MARKERS):
+                        return True, f"Challenge cleared · {time.time()-t0:.1f}s · real browser"
                 return False, "Blocked by challenge/Cloudflare"
             context.close()
             return True, f"HTTP {status or 200} · {time.time()-t0:.1f}s · real browser"
@@ -695,6 +712,8 @@ def guns_worker(target_url, proxies, worker_id, stop_event):
     use_tor = BOT_STATE.get("use_tor", False)
     tor_idx = worker_id % 5 if use_tor else None
     consecutive_fails = 0
+    tor_403_streak = 0
+    tor_block_warned = False
 
     while not stop_event.is_set():
         # Re-derive the verified engine every round so an engine that just finished
@@ -702,12 +721,24 @@ def guns_worker(target_url, proxies, worker_id, stop_event):
         engine = ENGINE_PROBE_RESULT[0] or probe_engine(block=False) or "requests"
         if engine == "requests":
             _ensure_browser_install()
+
+        # The target keeps rejecting Tor exits (403)? Fall back to the user's proxies —
+        # or direct (which usually works) — instead of wasting attempts on a blocked network.
+        if use_tor and tor_403_streak >= 3:
+            use_tor = False
+            with BOT_LOCK:
+                BOT_STATE["tor_blocked"] = True
+            if not tor_block_warned:
+                tor_block_warned = True
+                if proxies:
+                    bot_log("warn", f"worker {worker_id+1} · Target blocks Tor exit IPs (403) — switching to your proxies for the rest of this run.")
+                else:
+                    bot_log("warn", f"worker {worker_id+1} · Target blocks Tor exit IPs (403) — switching to direct. Tor views won't count on this target; add residential proxies for real views.")
+
         proxy = proxies[worker_id % len(proxies)] if proxies else None
         if use_tor:
             proxy = f"socks5h://127.0.0.1:{9050 + tor_idx}"
-
-        # Before every attempt, rotate the circuit so each view comes from a fresh exit IP.
-        if use_tor:
+            # Before every attempt, rotate the circuit so each view comes from a fresh exit IP.
             rotate_tor_circuit(tor_idx, verify_ip=False)
 
         ok, detail = None, None
@@ -756,11 +787,18 @@ def guns_worker(target_url, proxies, worker_id, stop_event):
                 w["views"] += 1
                 w["status"] = "ok"
                 consecutive_fails = 0
+                if use_tor:
+                    tor_403_streak = 0
+                    BOT_STATE["tor_blocked"] = False
             else:
                 BOT_STATE["errors"] += 1
                 w["errors"] += 1
                 w["status"] = "fail"
                 consecutive_fails += 1
+                if use_tor and "403" in (detail or ""):
+                    tor_403_streak += 1
+                elif not use_tor:
+                    tor_403_streak = 0
             w["last"] = detail
             w["last_at"] = time.strftime("%H:%M:%S")
             if use_tor:
@@ -948,6 +986,7 @@ def start_guns_lol():
             "browser_count": num_browsers,
             "engine": engine,
             "use_tor": use_tor and TOR_AVAILABLE,
+            "tor_blocked": False,
             "views_sent": 0,
             "attempts": 0,
             "errors": 0,

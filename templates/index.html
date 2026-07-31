@@ -315,6 +315,11 @@
         .engine-badge.chrome { background: rgba(88,101,242,0.12); color: #7b83f6; border: 1px solid rgba(88,101,242,0.3); }
         .engine-badge.requests { background: rgba(250,166,26,0.12); color: var(--gold); border: 1px solid rgba(250,166,26,0.3); }
         .engine-badge.idle { background: var(--surface2); color: var(--muted); border: 1px solid var(--border); }
+        .tor-warning {
+            margin-top: 10px; padding: 10px 12px; border-radius: 8px;
+            background: rgba(237,66,69,0.1); color: #ff6b6e;
+            border: 1px solid rgba(237,66,69,0.35); font-size: 13px; line-height: 1.45;
+        }
 
         .stat-grid {
             display: grid;
@@ -454,6 +459,7 @@
             </div>
 
             <div class="engine-badge idle" id="engineBadge">Engine: detecting...</div>
+            <div class="tor-warning" id="torWarning" style="display:none">&#x26A0;&#xFE0F; <strong>Target is blocking Tor exit IPs (403)</strong> — Tor views won't count on this target. The bot switched to your proxies/direct. Paste residential proxies below for real views.</div>
 
             <div class="stat-grid">
                 <div class="stat blue"><div class="num" id="statViews">0</div><div class="lbl">Verified views</div></div>
@@ -533,6 +539,8 @@
                 }
 
                 updateEngineBadge(s.engine);
+                const tw = document.getElementById('torWarning');
+                if (tw) tw.style.display = s.tor_blocked ? 'block' : 'none';
                 document.getElementById('statViews').textContent = s.views_sent;
                 document.getElementById('statAttempts').textContent = s.attempts;
                 document.getElementById('statErrors').textContent = s.errors;
