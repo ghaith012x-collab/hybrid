@@ -318,8 +318,24 @@ def _build_discord_headers(auth_token):
     }
 
 
+def _discord_err(code, err=""):
+    if code == 401:
+        return {"available": None, "status": 401, "discord_msg": "Token rejected (401) — invalid or expired user token. Make sure it's a USER token, not a bot token."}
+    if code == 429:
+        return {"available": None, "status": 429, "discord_msg": "Rate limited (429) — Discord is throttling requests"}
+    if code == 403:
+        return {"available": None, "status": 403, "discord_msg": "Forbidden (403) — token lacks permissions or account is flagged"}
+    return {"available": None, "status": code, "discord_msg": f"HTTP {code}: {err}"}
+
+
 def check_discord_username(username, auth_token, proxy_url=None, use_proxy=True):
-    """Returns {"available": bool|None, "status": int|None, "discord_msg": str|None}"""
+    """Returns {"available": bool|None, "status": int|None, "discord_msg": str|None}
+
+    The DIRECT connection is tried first and is the judge of the token. A 401 from a
+    proxy/Tor exit is NOT conclusive — Discord's anti-abuse flags many exit IPs and
+    rejects even valid tokens through them. The proxy is only a fallback for
+    rate-limits (429) or connection failures on the direct route.
+    """
     headers = _build_discord_headers(auth_token)
     payload = {"username": username}
 
@@ -332,37 +348,46 @@ def check_discord_username(username, auth_token, proxy_url=None, use_proxy=True)
             )
         return requests.post("https://discord.com/api/v9/users/@me/pomelo", headers=headers, json=payload, timeout=10)
 
-    strategies = []
+    def _verdict(resp):
+        code = resp.status_code
+        if code == 200:
+            data = resp.json()
+            return {"available": data.get("taken") is False, "status": 200, "discord_msg": None}
+        try:
+            body = resp.json()
+            err = body.get("message", str(body))
+        except Exception:
+            err = resp.text[:200]
+        return _discord_err(code, err)
+
+    strategies = ["direct"]
     if use_proxy and proxy_url and TOR_AVAILABLE:
         strategies.append("proxy")
-    strategies.append("direct")
 
+    direct_verdict = None
+    last_err = None
     for s in strategies:
         try:
             resp = _do(s)
-            code = resp.status_code
-            if code == 200:
-                data = resp.json()
-                return {"available": data.get("taken") is False, "status": 200, "discord_msg": None}
-            if code == 401:
-                return {"available": None, "status": 401, "discord_msg": "Token rejected (401) — invalid or expired user token. Make sure it's a USER token, not a bot token."}
-            if code == 429:
-                return {"available": None, "status": 429, "discord_msg": "Rate limited (429) — Discord is throttling requests"}
-            if code == 403:
-                return {"available": None, "status": 403, "discord_msg": "Forbidden (403) — token lacks permissions or account is flagged"}
-            try:
-                body = resp.json()
-                err = body.get("message", str(body))
-            except Exception:
-                err = resp.text[:200]
-            return {"available": None, "status": code, "discord_msg": f"HTTP {code}: {err}"}
+            v = _verdict(resp)
+            if v["status"] == 200:
+                return v
+            if s == "direct":
+                direct_verdict = v
+                if v["status"] != 429:
+                    return v  # direct 401/403/other is conclusive
+            else:
+                if v["status"] in (401, 403, 500, 502, 503, 504):
+                    last_err = {"available": None, "status": v["status"], "discord_msg": f"Proxy attempt failed (HTTP {v['status']}) — proxy/Tor exit likely flagged by Discord"}
+                else:
+                    last_err = v
         except requests.exceptions.Timeout:
-            if s == "direct":
-                return {"available": None, "status": None, "discord_msg": "Timed out — Discord unreachable"}
+            last_err = {"available": None, "status": None, "discord_msg": "Timed out — Discord unreachable"}
         except Exception as e:
-            if s == "direct":
-                return {"available": None, "status": None, "discord_msg": f"Connection error: {str(e)[:150]}"}
-    return {"available": None, "status": None, "discord_msg": "All connection attempts failed"}
+            last_err = {"available": None, "status": None, "discord_msg": f"Connection error: {str(e)[:150]}"}
+    if direct_verdict:
+        return direct_verdict
+    return last_err or {"available": None, "status": None, "discord_msg": "All connection attempts failed"}
 
 
 # ── guns.lol view bot engine ───────────────────────────────────────────
