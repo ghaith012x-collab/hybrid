@@ -515,6 +515,34 @@ def detect_engine():
     return "requests"
 
 
+def _browser_proxy(proxy_url):
+    """Convert a proxy URL into (server, username, password) Chromium/Playwright can use.
+
+    Chromium does NOT understand requests-style 'socks5h://' (remote DNS) or 'socks4a://'
+    schemes — it throws net::ERR_NO_SUPPORTED_PROXIES. Map them to schemes it accepts,
+    and peel out any embedded credentials for Playwright's proxy options.
+    """
+    if not proxy_url:
+        return None, None, None
+    server, username, password = proxy_url, None, None
+    if "://" in server:
+        scheme, rest = server.split("://", 1)
+        scheme = scheme.lower()
+        if scheme == "socks5h":
+            scheme = "socks5"
+        elif scheme == "socks4a":
+            scheme = "socks4"
+        if "@" in rest:
+            creds, host = rest.rsplit("@", 1)
+            if ":" in creds:
+                username, password = creds.split(":", 1)
+            else:
+                username = creds
+            rest = host
+        server = f"{scheme}://{rest}"
+    return server, username, password
+
+
 def _send_playwright_view(target_url, proxy_url):
     from playwright.sync_api import sync_playwright
     ua = random.choice(USER_AGENTS)
@@ -530,7 +558,13 @@ def _send_playwright_view(target_url, proxy_url):
         ],
     }
     if proxy_url:
-        launch_opts["proxy"] = {"server": proxy_url}
+        server, user, pw = _browser_proxy(proxy_url)
+        if server:
+            launch_opts["proxy"] = {"server": server}
+            if user:
+                launch_opts["proxy"]["username"] = user
+            if pw:
+                launch_opts["proxy"]["password"] = pw
     with sync_playwright() as p:
         browser = p.chromium.launch(**launch_opts)
         try:
@@ -569,7 +603,9 @@ def _send_chrome_view(target_url, proxy_url):
     from selenium.webdriver.chrome.options import Options
     opts = Options()
     if proxy_url:
-        opts.add_argument(f"--proxy-server={proxy_url}")
+        server, _, _ = _browser_proxy(proxy_url)
+        if server:
+            opts.add_argument(f"--proxy-server={server}")
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
