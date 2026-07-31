@@ -8,6 +8,7 @@ import time
 import json
 import threading
 import re
+import sys
 import glob
 from collections import deque
 from flask import Flask, render_template, jsonify, request, Response, stream_with_context
@@ -407,6 +408,54 @@ def _find_chromium_executable():
 ENGINE_PROBE_RESULT = [None]      # None = not probed yet; else playwright|chrome|requests
 ENGINE_PROBE_LOCK = threading.Lock()
 CHROME_LAUNCH_LOCK = threading.Lock()
+BROWSER_INSTALL_STATE = [None]    # None | installing | done | failed
+BROWSER_INSTALL_AT = [0.0]
+
+
+def _ensure_browser_install():
+    """Kick off a background Playwright Chromium install when no engine works (idempotent)."""
+    with ENGINE_PROBE_LOCK:
+        state = BROWSER_INSTALL_STATE[0]
+        if state == "installing" or state == "done":
+            return
+        if state == "failed" and time.time() - BROWSER_INSTALL_AT[0] < 1800:
+            return  # don't hammer a failing install — retry at most every 30 min
+        BROWSER_INSTALL_STATE[0] = "installing"
+    threading.Thread(target=_auto_provision_browser, daemon=True).start()
+
+
+def _auto_provision_browser():
+    """Install Playwright + bundled Chromium so the app self-heals to a real browser."""
+    bot_log("info", "No browser engine found — installing Playwright Chromium in the background (~120MB download)...")
+    try:
+        try:
+            import playwright  # noqa: F401
+        except ImportError:
+            bot_log("info", "Installing playwright pip package...")
+            subprocess.run([sys.executable, "-m", "pip", "install", "playwright"],
+                           capture_output=True, timeout=600)
+        bot_log("info", "Downloading Chromium browser (one-time, background)...")
+        r = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
+                           capture_output=True, timeout=1200)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout or b"")[-300:].decode(errors="replace").strip())
+        # System libs — needs root; tolerable if it fails (some bases already have them).
+        try:
+            subprocess.run([sys.executable, "-m", "playwright", "install-deps", "chromium"],
+                           capture_output=True, timeout=900)
+        except Exception:
+            pass
+    except Exception as e:
+        BROWSER_INSTALL_STATE[0] = "failed"
+        BROWSER_INSTALL_AT[0] = time.time()
+        bot_log("error", f"Browser auto-install failed: {str(e)[:150]}")
+        return
+    BROWSER_INSTALL_STATE[0] = "done"
+    BROWSER_INSTALL_AT[0] = time.time()
+    bot_log("info", "Chromium installed — re-probing the engine...")
+    with ENGINE_PROBE_LOCK:
+        ENGINE_PROBE_RESULT[0] = None
+    _run_engine_probe()
 
 
 def _run_engine_probe():
@@ -440,7 +489,10 @@ def _run_engine_probe():
             + (" (real browser verified)" if verdict != "requests" else "")
             + (" — raw HTTP fallback, views may not count" if verdict == "requests" else ""),
         )
-        return verdict
+    # No usable engine → make the app install one in the background.
+    if verdict == "requests":
+        _ensure_browser_install()
+    return verdict
 
 
 def probe_engine(block=True, timeout=60):
@@ -604,12 +656,16 @@ def _downgrade_engine(engine):
 
 
 def guns_worker(target_url, proxies, worker_id, stop_event):
-    engine = BOT_STATE.get("engine") or probe_engine(block=False) or "requests"
     use_tor = BOT_STATE.get("use_tor", False)
     tor_idx = worker_id % 5 if use_tor else None
     consecutive_fails = 0
 
     while not stop_event.is_set():
+        # Re-derive the verified engine every round so an engine that just finished
+        # installing (or got upgraded) is picked up without a restart.
+        engine = ENGINE_PROBE_RESULT[0] or probe_engine(block=False) or "requests"
+        if engine == "requests":
+            _ensure_browser_install()
         proxy = proxies[worker_id % len(proxies)] if proxies else None
         if use_tor:
             proxy = f"socks5h://127.0.0.1:{9050 + tor_idx}"
@@ -639,6 +695,7 @@ def guns_worker(target_url, proxies, worker_id, stop_event):
                     new_engine = _downgrade_engine(engine)
                     bot_log("warn", f"worker {worker_id+1} · {type(e).__name__} — engine {engine} broken, falling back to {new_engine}")
                     engine = new_engine
+                    ENGINE_PROBE_RESULT[0] = new_engine  # keep probe cache in sync
                     if engine == "requests":
                         bot_log("warn", f"worker {worker_id+1} · raw HTTP fallback — views may not be counted")
                     continue
@@ -864,7 +921,8 @@ def start_guns_lol():
 
     bot_log("info", f"Starting {num_browsers} worker(s) · engine={engine} · tor={BOT_STATE['use_tor']} · proxies={len(proxies)}")
     if engine == "requests":
-        bot_log("warn", "No browser found (Playwright/Chrome missing). Falling back to raw HTTP — many sites won't count these views.")
+        bot_log("warn", "No browser found (Playwright/Chrome missing) — installing one in the background. Views start counting once it's ready.")
+        _ensure_browser_install()
 
     for i in range(num_browsers):
         t = threading.Thread(target=guns_worker, args=(target, proxies, i, BOT_STOP), daemon=True)
@@ -893,6 +951,7 @@ def bot_status():
     with BOT_LOCK:
         state = dict(BOT_STATE)
         state["logs"] = list(BOT_LOGS)[-80:]
+        state["browser_install"] = BROWSER_INSTALL_STATE[0]
         return jsonify(state)
 
 
@@ -910,6 +969,8 @@ def status():
     # Also verify the browser engine in the background so Start is instant later.
     if not ENGINE_PROBE_RESULT[0]:
         threading.Thread(target=_run_engine_probe, daemon=True).start()
+    if detect_engine() == "requests":
+        _ensure_browser_install()
     exit_ips = []
     if TOR_AVAILABLE:
         for i in range(5):
@@ -923,6 +984,7 @@ def status():
         "tor_rotations": sum(TOR_ROTATIONS),
         "tor_exit_ips": exit_ips,
         "engine": detect_engine(),
+        "browser_install": BROWSER_INSTALL_STATE[0],
         "views": BOT_STATE.get("views_sent", 0),
     })
 
@@ -932,4 +994,6 @@ if __name__ == "__main__":
     threading.Thread(target=ensure_tor_instances, daemon=True).start()
     # Probe the browser engine in the background too.
     threading.Thread(target=_run_engine_probe, daemon=True).start()
+    if detect_engine() == "requests":
+        _ensure_browser_install()
     app.run(host="0.0.0.0", port=8080, threaded=True)

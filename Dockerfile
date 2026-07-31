@@ -20,6 +20,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Bake a real browser engine into the image so the bot never falls back to raw HTTP.
+RUN python -m playwright install chromium && python -m playwright install-deps chromium
+
 COPY . .
 
 EXPOSE 8080
