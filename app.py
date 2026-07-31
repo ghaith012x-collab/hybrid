@@ -8,6 +8,7 @@ import time
 import json
 import threading
 import re
+import glob
 from collections import deque
 from flask import Flask, render_template, jsonify, request, Response, stream_with_context
 from flask_cors import CORS
@@ -333,7 +334,7 @@ CHALLENGE_MARKERS = ["just a moment", "cf-challenge", "checking your browser", "
 
 
 def _chrome_available():
-    for name in ["google-chrome", "chromium", "chromium-browser", "google-chrome-stable"]:
+    for name in ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"]:
         try:
             subprocess.run([name, "--version"], capture_output=True, timeout=5, check=True)
             return True
@@ -342,25 +343,119 @@ def _chrome_available():
     return False
 
 
+def _playwright_cache_dirs():
+    """All plausible locations where Playwright's browsers may live (HOME differs per runner)."""
+    dirs = []
+    env = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if env:
+        dirs.append(env)
+    home = os.path.expanduser("~")
+    dirs.append(os.path.join(home, ".cache", "ms-playwright"))
+    dirs.append("/root/.cache/ms-playwright")
+    dirs.append("/ms-playwright")
+    try:
+        dirs += glob.glob("/home/*/.cache/ms-playwright")
+    except Exception:
+        pass
+    seen, out = set(), []
+    for d in dirs:
+        if d and d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
 def _playwright_browser_ready():
-    """True when playwright is installed AND a chromium browser was downloaded."""
+    """True when playwright is installed AND a chromium browser was downloaded anywhere on disk."""
     try:
         import playwright  # noqa: F401
     except ImportError:
         return False
-    candidates = [
-        os.environ.get("PLAYWRIGHT_BROWSERS_PATH"),
-        os.path.expanduser("~/.cache/ms-playwright"),
-    ]
-    for base in candidates:
-        if base and os.path.isdir(base):
+    for base in _playwright_cache_dirs():
+        try:
             for d in os.listdir(base):
                 if "chromium" in d:
                     return True
+        except OSError:
+            continue
     return False
 
 
+def _find_chromium_executable():
+    """Locate a real chromium executable from Playwright's caches (for the chrome engine fallback)."""
+    for base in _playwright_cache_dirs():
+        try:
+            entries = os.listdir(base)
+        except OSError:
+            continue
+        for d in entries:
+            if "chromium" not in d:
+                continue
+            try:
+                subs = os.listdir(os.path.join(base, d))
+            except OSError:
+                continue
+            for sub in subs:
+                for name in ("chrome", "headless_shell", "chromium"):
+                    exe = os.path.join(base, d, sub, name)
+                    if os.path.exists(exe):
+                        return exe
+    return None
+
+
+# ── Engine probe: verify a browser REALLY launches before using it ─────
+ENGINE_PROBE_RESULT = [None]      # None = not probed yet; else playwright|chrome|requests
+ENGINE_PROBE_LOCK = threading.Lock()
+CHROME_LAUNCH_LOCK = threading.Lock()
+
+
+def _run_engine_probe():
+    """Launch a real browser against a neutral page once; cache the verdict."""
+    if ENGINE_PROBE_RESULT[0]:
+        return ENGINE_PROBE_RESULT[0]
+    with ENGINE_PROBE_LOCK:
+        if ENGINE_PROBE_RESULT[0]:
+            return ENGINE_PROBE_RESULT[0]
+        verdict = "requests"
+        # 1) Playwright's bundled Chromium is the most reliable — no system deps.
+        try:
+            if _playwright_browser_ready():
+                ok, _ = _send_playwright_view("https://example.com", None)
+                if ok:
+                    verdict = "playwright"
+        except Exception:
+            pass
+        # 2) undetected_chromedriver — only if a launchable Chrome exists.
+        if verdict == "requests":
+            try:
+                ok, _ = _send_chrome_view("https://example.com", None)
+                if ok:
+                    verdict = "chrome"
+            except Exception:
+                pass
+        ENGINE_PROBE_RESULT[0] = verdict
+        bot_log(
+            "info",
+            f"Engine probe complete → {verdict}"
+            + (" (real browser verified)" if verdict != "requests" else "")
+            + (" — raw HTTP fallback, views may not count" if verdict == "requests" else ""),
+        )
+        return verdict
+
+
+def probe_engine(block=True, timeout=60):
+    """Return the verified engine, probing on first call (runs in a background thread)."""
+    if not ENGINE_PROBE_RESULT[0]:
+        t = threading.Thread(target=_run_engine_probe, daemon=True)
+        t.start()
+        if block:
+            t.join(timeout=timeout)
+    return ENGINE_PROBE_RESULT[0] or detect_engine()
+
+
 def detect_engine():
+    if ENGINE_PROBE_RESULT[0]:
+        return ENGINE_PROBE_RESULT[0]
     if _playwright_browser_ready():
         return "playwright"
     if _chrome_available():
@@ -431,7 +526,14 @@ def _send_chrome_view(target_url, proxy_url):
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument(f"--user-agent={random.choice(USER_AGENTS)}")
     opts.add_experimental_option("prefs", {"disk_cache_size": 0})
-    driver = uc.Chrome(options=opts)
+    # No system Chrome? Point undetected_chromedriver at the Chromium we already
+    # have from Playwright. The engine probe verifies this combo actually works.
+    if not _chrome_available():
+        exe = _find_chromium_executable()
+        if exe:
+            opts.binary_location = exe
+    with CHROME_LAUNCH_LOCK:
+        driver = uc.Chrome(options=opts)
     try:
         driver.set_page_load_timeout(30)
         t0 = time.time()
@@ -483,8 +585,26 @@ def _is_retryable_conn_error(e):
     return any(m in hay for m in markers)
 
 
+FATAL_ENGINE_MARKERS = (
+    "sessionnotcreated", "cannot connect to chrome", "webdriverexception",
+    "text file busy", "no such file or directory", "executable doesn't exist",
+    "chromedriver", "could not find chrome", "no chrome binary", "browserexception",
+    "session not created", "invalid argument",
+)
+
+
+def _is_fatal_engine_error(e):
+    """True when the browser engine itself is broken (driver/launch failures), not the network."""
+    hay = f"{type(e).__name__}: {e}".lower()
+    return any(m in hay for m in FATAL_ENGINE_MARKERS)
+
+
+def _downgrade_engine(engine):
+    return {"chrome": "playwright", "playwright": "requests"}.get(engine, "requests")
+
+
 def guns_worker(target_url, proxies, worker_id, stop_event):
-    engine = BOT_STATE["engine"]
+    engine = BOT_STATE.get("engine") or probe_engine(block=False) or "requests"
     use_tor = BOT_STATE.get("use_tor", False)
     tor_idx = worker_id % 5 if use_tor else None
     consecutive_fails = 0
@@ -513,6 +633,15 @@ def guns_worker(target_url, proxies, worker_id, stop_event):
                 break  # got a definitive answer
             except Exception as e:
                 detail = f"{type(e).__name__}: {str(e)[:100]}"
+                if _is_fatal_engine_error(e) and engine != "requests":
+                    # Engine is broken (missing chrome, driver mismatch…) — switch to the
+                    # next working engine instead of hammering the broken one.
+                    new_engine = _downgrade_engine(engine)
+                    bot_log("warn", f"worker {worker_id+1} · {type(e).__name__} — engine {engine} broken, falling back to {new_engine}")
+                    engine = new_engine
+                    if engine == "requests":
+                        bot_log("warn", f"worker {worker_id+1} · raw HTTP fallback — views may not be counted")
+                    continue
                 if _is_retryable_conn_error(e):
                     # Connection reset / dead circuit → rotate and retry on a fresh exit IP.
                     if use_tor:
@@ -716,7 +845,8 @@ def start_guns_lol():
     elif not proxies:
         bot_log("warn", "No proxies configured and Tor unavailable — using direct connection (one IP).")
 
-    engine = detect_engine()
+    # Verify a browser really launches before spawning workers (cached after first probe).
+    engine = probe_engine(block=True, timeout=60)
 
     BOT_STOP.clear()
     with BOT_LOCK:
@@ -777,6 +907,9 @@ def status():
     # Lazily start Tor when the page loads so rotation is ready when the user hits Start.
     if not TOR_STARTED and not TOR_AVAILABLE:
         threading.Thread(target=ensure_tor_instances, daemon=True).start()
+    # Also verify the browser engine in the background so Start is instant later.
+    if not ENGINE_PROBE_RESULT[0]:
+        threading.Thread(target=_run_engine_probe, daemon=True).start()
     exit_ips = []
     if TOR_AVAILABLE:
         for i in range(5):
@@ -797,4 +930,6 @@ def status():
 if __name__ == "__main__":
     # Start Tor in the background so circuits are ready by the time the UI loads.
     threading.Thread(target=ensure_tor_instances, daemon=True).start()
+    # Probe the browser engine in the background too.
+    threading.Thread(target=_run_engine_probe, daemon=True).start()
     app.run(host="0.0.0.0", port=8080, threaded=True)
