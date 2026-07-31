@@ -242,6 +242,34 @@ def rotate_tor_circuit(instance_idx, verify_ip=True):
         return False
 
 
+def tor_target_probe(target_url, max_instances=2):
+    """One real-browser view through Tor to check if the target accepts Tor exits.
+
+    Returns (True, detail) when a Tor view loads, (False, detail) when the target
+    blocks Tor (403/challenge), or (None, 'inconclusive') when it couldn't tell.
+    """
+    if not TOR_AVAILABLE:
+        return None, "tor unavailable"
+    tried = 0
+    for i in range(5):
+        if not TOR_READY[i]:
+            continue
+        tried += 1
+        try:
+            rotate_tor_circuit(i, verify_ip=False)
+            ok, detail = _send_playwright_view(target_url, f"socks5h://127.0.0.1:{9050 + i}")
+            low = detail.lower()
+            if "403" in detail or "challenge" in low or "flagged" in low or "blocked" in low:
+                return False, detail
+            if ok:
+                return True, detail
+        except Exception:
+            pass
+        if tried >= max_instances:
+            break
+    return None, "inconclusive"
+
+
 # ── Discord checker ────────────────────────────────────────────────────
 
 def _build_discord_headers(auth_token):
@@ -724,7 +752,7 @@ def guns_worker(target_url, proxies, worker_id, stop_event):
 
         # The target keeps rejecting Tor exits (403)? Fall back to the user's proxies —
         # or direct (which usually works) — instead of wasting attempts on a blocked network.
-        if use_tor and tor_403_streak >= 3:
+        if use_tor and tor_403_streak >= 2:
             use_tor = False
             with BOT_LOCK:
                 BOT_STATE["tor_blocked"] = True
@@ -970,11 +998,25 @@ def start_guns_lol():
     if use_tor and not TOR_AVAILABLE:
         ensure_tor_instances()
 
+    # Pre-flight: check whether this target actually accepts Tor exits before
+    # spawning a swarm that would just rack up 403s. Falls back to proxies/direct.
+    tor_blocked = False
     if use_tor and TOR_AVAILABLE:
+        bot_log("info", "Probing target through Tor (one test view)…")
+        probe_ok, probe_detail = tor_target_probe(target)
+        if probe_ok is False:
+            tor_blocked = True
+            bot_log("warn", f"Target rejects Tor exits ({probe_detail}) — starting WITHOUT Tor. " + ("Using your proxies instead." if proxies else "Using direct (single IP). Add residential proxies for real views."))
+        elif probe_ok is True:
+            bot_log("info", f"Tor probe passed — exits accepted ({probe_detail}).")
+        else:
+            bot_log("warn", "Tor probe inconclusive — starting with Tor rotation; workers auto-fallback if blocked.")
+
+    if use_tor and TOR_AVAILABLE and not tor_blocked:
         proxies = []  # workers build socks5h://127.0.0.1:port from tor_idx directly
         bot_log("info", "Tor rotation enabled — each view will use a fresh exit IP.")
     elif not proxies:
-        bot_log("warn", "No proxies configured and Tor unavailable — using direct connection (one IP).")
+        bot_log("warn", "No proxies configured — using direct connection (single IP). Views will be limited; add residential proxies.")
 
     # Verify a browser really launches before spawning workers (cached after first probe).
     engine = probe_engine(block=True, timeout=60)
@@ -985,8 +1027,8 @@ def start_guns_lol():
             "running": True,
             "browser_count": num_browsers,
             "engine": engine,
-            "use_tor": use_tor and TOR_AVAILABLE,
-            "tor_blocked": False,
+            "use_tor": use_tor and TOR_AVAILABLE and not tor_blocked,
+            "tor_blocked": tor_blocked,
             "views_sent": 0,
             "attempts": 0,
             "errors": 0,
