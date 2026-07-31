@@ -72,53 +72,172 @@ def bot_log(level, msg):
         })
 
 
-# ── Tor ────────────────────────────────────────────────────────────────
+# ── Tor (real circuit rotation) ────────────────────────────────────────
 
-def start_tor_instances():
-    global TOR_AVAILABLE
+TOR_LOCK = threading.Lock()
+TOR_STARTED = False
+TOR_READY = [False] * 5      # per-instance SOCKS readiness
+TOR_ROTATIONS = [0] * 5      # circuit rotation counter per instance
+TOR_EXIT_IPS = [None] * 5    # last seen exit IP per instance
+TOR_EXIT_IP_TTL = [0.0] * 5
+
+
+def _tor_binary():
+    """Locate the tor binary."""
+    for cand in ["/usr/sbin/tor", "/usr/bin/tor", "/bin/tor"]:
+        if os.path.exists(cand):
+            return cand
     try:
         subprocess.run(["tor", "--version"], capture_output=True, timeout=5, check=True)
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        print("[tor] tor binary not found — proxies disabled")
-        return
+        return "tor"
+    except Exception:
+        return None
+
+
+def _port_open(port, host="127.0.0.1", timeout=1.5):
+    import socket
+    try:
+        s = socket.create_connection((host, port), timeout=timeout)
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+def _tor_instance_config(i):
+    port = 9050 + i
+    control_port = 9050 + i + 10000
+    tor_dir = f"/tmp/tor_{i}"
+    os.makedirs(tor_dir, exist_ok=True)
+    return port, control_port, tor_dir
+
+
+def ensure_tor_instances():
+    """Start Tor instances once (thread-safe). Returns True if any SOCKS port is up."""
+    global TOR_AVAILABLE, TOR_STARTED
+    with TOR_LOCK:
+        if TOR_STARTED:
+            return TOR_AVAILABLE
+        TOR_STARTED = True
+
+    binary = _tor_binary()
+    if not binary:
+        bot_log("error", "tor binary not found — install it (apt install tor) to enable rotation")
+        return False
+
+    TOR_INSTANCES.clear()
     for i in range(5):
         try:
-            port = 9050 + i
-            control_port = 9050 + i + 10000
-            tor_dir = f"/tmp/tor_{i}"
-            os.makedirs(tor_dir, exist_ok=True)
+            port, control_port, tor_dir = _tor_instance_config(i)
             torrc_path = f"{tor_dir}/torrc"
             with open(torrc_path, "w") as f:
-                f.write(f"SocksPort {port}\nControlPort {control_port}\nDataDirectory {tor_dir}\nMaxCircuitDirtiness 10\nNewCircuitPeriod 15\n")
-            proc = subprocess.Popen(["tor", "-f", torrc_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                f.write(
+                    f"SocksPort {port}\n"
+                    f"ControlPort {control_port}\n"
+                    f"DataDirectory {tor_dir}\n"
+                    f"MaxCircuitDirtiness 120\n"
+                    f"NewCircuitPeriod 60\n"
+                    f"ExitRelay 0\n"
+                )
+            proc = subprocess.Popen(
+                [binary, "-f", torrc_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
             TOR_INSTANCES.append(proc)
-            time.sleep(1.5)
         except Exception as e:
-            print(f"[tor] instance {i} failed: {e}")
-    if TOR_INSTANCES:
+            bot_log("warn", f"tor instance {i} failed to start: {e}")
+
+    # Give them a moment to open SOCKS ports, then poll readiness.
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        any_up = False
+        for i in range(5):
+            if not TOR_READY[i]:
+                port, _, _ = _tor_instance_config(i)
+                if _port_open(port):
+                    TOR_READY[i] = True
+            any_up = any_up or TOR_READY[i]
+        if any_up:
+            break
+        time.sleep(1)
+
+    ready = sum(1 for r in TOR_READY if r)
+    if ready:
         TOR_AVAILABLE = True
-        print(f"[tor] started {len(TOR_INSTANCES)} instances")
+        bot_log("info", f"Tor ready: {ready}/5 instances listening")
     else:
-        print("[tor] no instances started")
+        TOR_AVAILABLE = False
+        bot_log("error", "Tor instances failed to open SOCKS ports — rotation unavailable")
+    return TOR_AVAILABLE
 
 
-def rotate_proxy(proxy_url):
-    if not TOR_AVAILABLE or "127.0.0.1" not in proxy_url:
-        return
+def _read_control_reply(sock, timeout=3):
+    import socket
+    sock.settimeout(timeout)
+    buf = b""
     try:
-        port = int(proxy_url.split(":")[-1])
-        s = socket_connect((port + 10000))
+        while b"250 OK" not in buf and len(buf) < 4096:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
     except Exception:
         pass
+    return buf
 
 
-def socket_connect(control_port):
+def tor_exit_ip(instance_idx):
+    """Return the current exit IP for a Tor instance via a quick proxied request (cached 10s)."""
+    now = time.time()
+    if now - TOR_EXIT_IP_TTL[instance_idx] < 10 and TOR_EXIT_IPS[instance_idx]:
+        return TOR_EXIT_IPS[instance_idx]
+    try:
+        proxy = f"socks5h://127.0.0.1:{9050 + instance_idx}"
+        r = requests.get(
+            "https://api.ipify.org",
+            proxies={"http": proxy, "https": proxy},
+            timeout=8,
+        )
+        ip = r.text.strip()
+        if ip:
+            TOR_EXIT_IPS[instance_idx] = ip
+            TOR_EXIT_IP_TTL[instance_idx] = now
+            return ip
+    except Exception:
+        pass
+    return TOR_EXIT_IPS[instance_idx]
+
+
+def rotate_tor_circuit(instance_idx, verify_ip=True):
+    """Force a NEW circuit (new exit IP) on a Tor instance via its control port."""
+    if not (0 <= instance_idx < 5) or not TOR_READY[instance_idx]:
+        return False
     import socket
-    s = socket.socket()
-    s.settimeout(5)
-    s.connect(("127.0.0.1", control_port))
-    s.send(b'AUTHENTICATE ""\r\nSIGNAL NEWNYM\r\nQUIT\r\n')
-    s.close()
+    port, control_port, _ = _tor_instance_config(instance_idx)
+    try:
+        s = socket.create_connection(("127.0.0.1", control_port), timeout=5)
+        s.sendall(b'AUTHENTICATE ""\r\n')
+        _read_control_reply(s)
+        s.sendall(b"SIGNAL NEWNYM\r\n")
+        _read_control_reply(s)
+        s.sendall(b"QUIT\r\n")
+        s.close()
+        TOR_ROTATIONS[instance_idx] += 1
+
+        if verify_ip:
+            # Wait for the new circuit to come up (new exit IP).
+            old = TOR_EXIT_IPS[instance_idx]
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                new = tor_exit_ip(instance_idx)
+                if new and new != old:
+                    break
+                time.sleep(2)
+            TOR_EXIT_IP_TTL[instance_idx] = 0.0
+        return True
+    except Exception:
+        return False
 
 
 # ── Discord checker ────────────────────────────────────────────────────
@@ -349,35 +468,93 @@ def _send_requests_view(target_url, proxy_url):
     return True, f"HTTP {r.status_code} · raw HTTP (no JS — may not count)"
 
 
+def _is_retryable_conn_error(e):
+    """True when an exception is a connection-level reset we can survive by rotating the circuit."""
+    msg = f"{type(e).__name__}: {e}"
+    hay = msg.lower()
+    markers = (
+        "remotedisconnected", "remote end closed", "connection aborted",
+        "connection reset", "broken pipe", "connectionerror", "proxyerror",
+        "readtimeout", "connecttimeout", "timeout", "max retries exceeded",
+        "err_connection", "err_name_not_resolved", "err_tunnel", "networkerror",
+        "target page, context or browser has been closed", "browser has been closed",
+        "net::err", "dead proxy", "socks", "temporarily unavailable",
+    )
+    return any(m in hay for m in markers)
+
+
 def guns_worker(target_url, proxies, worker_id, stop_event):
     engine = BOT_STATE["engine"]
+    use_tor = BOT_STATE.get("use_tor", False)
+    tor_idx = worker_id % 5 if use_tor else None
+    consecutive_fails = 0
+
     while not stop_event.is_set():
         proxy = proxies[worker_id % len(proxies)] if proxies else None
-        try:
-            if engine == "playwright":
-                ok, detail = _send_playwright_view(target_url, proxy)
-            elif engine == "chrome":
-                ok, detail = _send_chrome_view(target_url, proxy)
-            else:
-                ok, detail = _send_requests_view(target_url, proxy)
-        except Exception as e:
-            ok, detail = False, f"{type(e).__name__}: {str(e)[:120]}"
+        if use_tor:
+            proxy = f"socks5h://127.0.0.1:{9050 + tor_idx}"
+
+        # Before every attempt, rotate the circuit so each view comes from a fresh exit IP.
+        if use_tor:
+            rotate_tor_circuit(tor_idx, verify_ip=False)
+
+        ok, detail = None, None
+        max_retries = 3 if use_tor else 2
+        for attempt in range(max_retries):
+            if stop_event.is_set():
+                return
+            try:
+                if engine == "playwright":
+                    ok, detail = _send_playwright_view(target_url, proxy)
+                elif engine == "chrome":
+                    ok, detail = _send_chrome_view(target_url, proxy)
+                else:
+                    ok, detail = _send_requests_view(target_url, proxy)
+                break  # got a definitive answer
+            except Exception as e:
+                detail = f"{type(e).__name__}: {str(e)[:100]}"
+                if _is_retryable_conn_error(e):
+                    # Connection reset / dead circuit → rotate and retry on a fresh exit IP.
+                    if use_tor:
+                        rotate_tor_circuit(tor_idx, verify_ip=False)
+                    time.sleep(1.5 + attempt * 1.5)
+                    continue
+                break  # non-connection error (e.g. bad URL) — don't retry
+
+        if ok is None:
+            ok, detail = False, detail or "no result"
 
         with BOT_LOCK:
             BOT_STATE["attempts"] += 1
-            w = BOT_STATE["workers"].setdefault(str(worker_id), {"status": "started", "views": 0, "errors": 0, "last": "—", "last_at": None})
+            w = BOT_STATE["workers"].setdefault(
+                str(worker_id), {"status": "started", "views": 0, "errors": 0, "last": "—", "last_at": None, "circuit": 0, "exit_ip": None}
+            )
             if ok:
                 BOT_STATE["views_sent"] += 1
                 w["views"] += 1
                 w["status"] = "ok"
+                consecutive_fails = 0
             else:
                 BOT_STATE["errors"] += 1
                 w["errors"] += 1
                 w["status"] = "fail"
+                consecutive_fails += 1
             w["last"] = detail
             w["last_at"] = time.strftime("%H:%M:%S")
+            if use_tor:
+                w["circuit"] = TOR_ROTATIONS[tor_idx]
+                ip = tor_exit_ip(tor_idx)
+                if ip:
+                    w["exit_ip"] = ip
         bot_log("ok" if ok else "error", f"worker {worker_id+1} · {detail}")
-        time.sleep(random.uniform(3, 8))
+
+        # Back off harder after repeated failures (dead circuit / blocked IP).
+        if consecutive_fails >= 3:
+            time.sleep(random.uniform(10, 20))
+            if use_tor:
+                rotate_tor_circuit(tor_idx, verify_ip=True)
+        else:
+            time.sleep(random.uniform(3, 8))
 
 
 # ── Routes ─────────────────────────────────────────────────────────────
@@ -527,10 +704,17 @@ def start_guns_lol():
 
     num_browsers = max(1, min(int(data.get("browsers", 3)), 8))
     proxies = _normalize_proxies(data.get("proxies"))
-    if not proxies:
-        proxies = list(PROXY_POOL) if TOR_AVAILABLE else []
-        if not proxies:
-            bot_log("warn", "No proxies configured — using direct connection (one IP).")
+    use_tor = bool(data.get("use_tor", True))
+
+    # Lazily bring Tor up if requested and it isn't running yet.
+    if use_tor and not TOR_AVAILABLE:
+        ensure_tor_instances()
+
+    if use_tor and TOR_AVAILABLE:
+        proxies = []  # workers build socks5h://127.0.0.1:port from tor_idx directly
+        bot_log("info", "Tor rotation enabled — each view will use a fresh exit IP.")
+    elif not proxies:
+        bot_log("warn", "No proxies configured and Tor unavailable — using direct connection (one IP).")
 
     engine = detect_engine()
 
@@ -540,14 +724,15 @@ def start_guns_lol():
             "running": True,
             "browser_count": num_browsers,
             "engine": engine,
+            "use_tor": use_tor and TOR_AVAILABLE,
             "views_sent": 0,
             "attempts": 0,
             "errors": 0,
             "started_at": time.strftime("%H:%M:%S"),
-            "workers": {str(i): {"status": "starting", "views": 0, "errors": 0, "last": "—", "last_at": None} for i in range(num_browsers)},
+            "workers": {str(i): {"status": "starting", "views": 0, "errors": 0, "last": "—", "last_at": None, "circuit": 0, "exit_ip": None} for i in range(num_browsers)},
         }
 
-    bot_log("info", f"Starting {num_browsers} worker(s) · engine={engine} · proxies={len(proxies)}")
+    bot_log("info", f"Starting {num_browsers} worker(s) · engine={engine} · tor={BOT_STATE['use_tor']} · proxies={len(proxies)}")
     if engine == "requests":
         bot_log("warn", "No browser found (Playwright/Chrome missing). Falling back to raw HTTP — many sites won't count these views.")
 
@@ -555,7 +740,13 @@ def start_guns_lol():
         t = threading.Thread(target=guns_worker, args=(target, proxies, i, BOT_STOP), daemon=True)
         t.start()
 
-    return jsonify({"status": "started", "browsers": num_browsers, "engine": engine, "proxies": len(proxies)})
+    return jsonify({
+        "status": "started",
+        "browsers": num_browsers,
+        "engine": engine,
+        "proxies": len(proxies),
+        "tor": BOT_STATE["use_tor"],
+    })
 
 
 @app.route("/stop_guns_lol", methods=["POST"])
@@ -583,14 +774,27 @@ def view_count():
 
 @app.route("/status")
 def status():
+    # Lazily start Tor when the page loads so rotation is ready when the user hits Start.
+    if not TOR_STARTED and not TOR_AVAILABLE:
+        threading.Thread(target=ensure_tor_instances, daemon=True).start()
+    exit_ips = []
+    if TOR_AVAILABLE:
+        for i in range(5):
+            if TOR_READY[i]:
+                ip = tor_exit_ip(i)
+                if ip:
+                    exit_ips.append(ip)
     return jsonify({
         "tor_available": TOR_AVAILABLE,
-        "tor_instances": len(TOR_INSTANCES),
+        "tor_instances": sum(1 for r in TOR_READY if r),
+        "tor_rotations": sum(TOR_ROTATIONS),
+        "tor_exit_ips": exit_ips,
         "engine": detect_engine(),
         "views": BOT_STATE.get("views_sent", 0),
     })
 
 
 if __name__ == "__main__":
-    start_tor_instances()
+    # Start Tor in the background so circuits are ready by the time the UI loads.
+    threading.Thread(target=ensure_tor_instances, daemon=True).start()
     app.run(host="0.0.0.0", port=8080, threaded=True)

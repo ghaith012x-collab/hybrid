@@ -338,7 +338,7 @@
         .worker-list { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
         .worker-row {
             display: grid;
-            grid-template-columns: 70px 1fr auto auto auto;
+            grid-template-columns: 70px 1fr auto auto auto auto;
             gap: 8px;
             align-items: center;
             background: var(--surface2);
@@ -355,6 +355,22 @@
         .wstatus.ok { color: var(--green); }
         .wstatus.fail { color: var(--red); }
         .wstatus.starting { color: var(--gold); }
+        .wcircuit { color: var(--gold); font-family: monospace; font-weight: 700; }
+
+        .check-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+            user-select: none;
+        }
+        .check-row input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            accent-color: var(--discord);
+            cursor: pointer;
+        }
+        .check-row .hint { font-size: 0.75em; color: var(--muted); text-transform: none; letter-spacing: 0; }
     </style>
 </head>
 <body>
@@ -421,7 +437,14 @@
             </div>
 
             <div class="input-group">
-                <label>Proxies (optional &middot; one per line)</label>
+                <label class="check-row">
+                    <input type="checkbox" id="useTor" checked>
+                    <span>Use Tor rotation <span class="hint">&mdash; new exit IP per view (recommended)</span></span>
+                </label>
+            </div>
+
+            <div class="input-group">
+                <label>Custom proxies (optional &middot; overrides Tor &middot; one per line)</label>
                 <textarea id="gunsProxies" placeholder="http://user:pass@host:port&#10;socks5://host:port&#10;host:port"></textarea>
             </div>
 
@@ -459,7 +482,7 @@
             try {
                 const r = await fetch('/status');
                 const s = await r.json();
-                updateTorBadge(s.tor_available, s.tor_instances);
+                updateTorBadge(s.tor_available, s.tor_instances, s.tor_exit_ips);
                 updateEngineBadge(s.engine);
             } catch (e) {
                 updateTorBadge(false, 0);
@@ -470,11 +493,14 @@
             updateBotStatus();
         })();
 
-        function updateTorBadge(available, count) {
+        function updateTorBadge(available, count, exitIps) {
             const b = document.getElementById('torBadge');
-            b.innerHTML = available
-                ? `<span class="dot online"></span> Tor: ${count} circuits`
-                : `<span class="dot offline"></span> Tor: unavailable (direct)`;
+            if (available) {
+                const ips = (exitIps || []).filter(Boolean);
+                b.innerHTML = `<span class="dot online"></span> Tor: ${count} circuits${ips.length ? ` &middot; exit ${ips[0]}` : ''}`;
+            } else {
+                b.innerHTML = `<span class="dot offline"></span> Tor: unavailable (direct)`;
+            }
         }
 
         function updateEngineBadge(engine) {
@@ -525,11 +551,13 @@
             const keys = Object.keys(workers).sort((a, b) => parseInt(a) - parseInt(b));
             list.innerHTML = keys.map(id => {
                 const w = workers[id];
+                const ip = w.exit_ip ? `<span class="wcircuit">${w.exit_ip}</span>` : '';
                 return `<div class="worker-row">
                     <span class="wid">W${parseInt(id) + 1}</span>
-                    <span class="wlast">${w.last || '—'}</span>
+                    <span class="wlast" title="${escapeHtml(w.last || '')}">${w.last || '—'}</span>
                     <span class="wviews">${w.views} views</span>
                     <span class="werrors">${w.errors} err</span>
+                    <span class="wcircuit">&#x1F504;${w.circuit || 0}</span>
                     <span class="wstatus ${w.status}">${w.status}</span>
                 </div>`;
             }).join('');
@@ -744,6 +772,7 @@
             const url = document.getElementById('gunsUrl').value.trim();
             const browsers = parseInt(document.getElementById('browserCount').value) || 3;
             const proxies = document.getElementById('gunsProxies').value.trim();
+            const useTor = document.getElementById('useTor').checked;
             const log = document.getElementById('gunsLog');
 
             if (!url) return toast('Please enter a target URL.');
@@ -755,14 +784,15 @@
                 const resp = await fetch('/start_guns_lol', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ url, browsers, proxies }),
+                    body: JSON.stringify({ url, browsers, proxies, use_tor: useTor }),
                 });
                 const data = await resp.json();
                 if (data.error) {
                     toast(`Error: ${data.error}`);
                 } else {
                     updateEngineBadge(data.engine);
-                    toast(`Bot started — ${data.engine} engine, ${data.browsers} workers, ${data.proxies} proxies`);
+                    const mode = data.tor ? 'Tor rotation' : (data.proxies > 0 ? `${data.proxies} proxies` : 'direct (1 IP)');
+                    toast(`Bot started — ${data.engine} engine, ${data.browsers} workers, ${mode}`);
                 }
                 updateBotStatus();
             } catch (e) {
