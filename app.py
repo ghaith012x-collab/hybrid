@@ -318,6 +318,35 @@ def _build_discord_headers(auth_token):
     }
 
 
+# ── Token validity cross-check (pomelo 401 ≠ bad token — Discord flags IPs) ──
+TOKEN_CHECK_CACHE = {}
+TOKEN_CHECK_LOCK = threading.Lock()
+
+
+def _check_token_valid(auth_token, ttl=60):
+    """GET /users/@me to independently verify the token (cached briefly).
+
+    Returns True (valid), False (invalid), or None (couldn't tell)."""
+    if not auth_token:
+        return False
+    with TOKEN_CHECK_LOCK:
+        hit = TOKEN_CHECK_CACHE.get(auth_token)
+        if hit and time.time() - hit[0] < ttl:
+            return hit[1]
+    try:
+        resp = requests.get(
+            "https://discord.com/api/v9/users/@me",
+            headers=_build_discord_headers(auth_token),
+            timeout=10,
+        )
+        valid = resp.status_code == 200
+    except Exception:
+        valid = None
+    with TOKEN_CHECK_LOCK:
+        TOKEN_CHECK_CACHE[auth_token] = (time.time(), valid)
+    return valid
+
+
 def _discord_err(code, err=""):
     if code == 401:
         return {"available": None, "status": 401, "discord_msg": "Token rejected (401) — invalid or expired user token. Make sure it's a USER token, not a bot token."}
@@ -361,7 +390,7 @@ def check_discord_username(username, auth_token, proxy_url=None, use_proxy=True)
         return _discord_err(code, err)
 
     strategies = ["direct"]
-    if use_proxy and proxy_url and TOR_AVAILABLE:
+    if use_proxy and proxy_url:
         strategies.append("proxy")
 
     direct_verdict = None
@@ -374,8 +403,18 @@ def check_discord_username(username, auth_token, proxy_url=None, use_proxy=True)
                 return v
             if s == "direct":
                 direct_verdict = v
+                if v["status"] == 401:
+                    # A pomelo 401 does NOT always mean a bad token — Discord's
+                    # anti-abuse flags many server IPs and returns 401 even for valid
+                    # tokens. Cross-check the token independently before condemning it.
+                    valid = _check_token_valid(auth_token)
+                    if valid is True:
+                        return {"available": None, "status": 401, "discord_msg": "Discord blocked this username check (HTTP 401) — your token is VALID, but Discord is flagging this server IP for username checking. Add residential proxies or run from a residential IP."}
+                    if valid is False:
+                        return v  # genuinely bad token
+                    return {"available": None, "status": 401, "discord_msg": "Discord returned 401 on the username check — re-verify your token with the Verify button (token may be flagged/expired, or this IP is blocked for checking)."}
                 if v["status"] != 429:
-                    return v  # direct 401/403/other is conclusive
+                    return v  # direct 403/other is conclusive
             else:
                 if v["status"] in (401, 403, 500, 502, 503, 504):
                     last_err = {"available": None, "status": v["status"], "discord_msg": f"Proxy attempt failed (HTTP {v['status']}) — proxy/Tor exit likely flagged by Discord"}
@@ -966,7 +1005,8 @@ def check_usernames():
     data = request.get_json(silent=True) or {}
     length = int(data.get("length", 3))
     auth_token = (data.get("auth_token") or "").strip()
-    use_proxy = bool(data.get("use_proxy", True))
+    proxy_list = _normalize_proxies(data.get("proxies"))
+    use_proxy = bool(proxy_list) and bool(data.get("use_proxy", True))
 
     if not auth_token:
         return jsonify({"error": "Discord auth token is required"}), 400
@@ -1010,7 +1050,7 @@ def check_usernames():
         start_idx = i * batch_size
         end_idx = start_idx + batch_size if i < num_workers - 1 else total
         batch = combinations[start_idx:end_idx]
-        proxy = PROXY_POOL[i]
+        proxy = proxy_list[i % len(proxy_list)] if proxy_list else None
         t = threading.Thread(target=worker, args=(batch, proxy), daemon=True)
         threads.append(t)
         t.start()

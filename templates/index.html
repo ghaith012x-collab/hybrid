@@ -406,7 +406,7 @@
         <!-- ── Discord checker ── -->
         <div class="card">
             <h2>&#x1F50D; Username Checker</h2>
-            <p class="sub">Paste your Discord <strong>user token</strong> (from browser DevTools), then check availability.</p>
+            <p class="sub">Paste your Discord <strong>user token</strong> (from browser DevTools), then check availability. If Discord blocks this server's IP (HTTP 401), paste residential proxies in the guns.lol card below &mdash; the checker uses them too.</p>
 
             <div class="input-group">
                 <label>Discord User Token</label>
@@ -685,7 +685,7 @@
                 const resp = await fetch('/check_usernames', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ length, auth_token: token, use_proxy: true }),
+                    body: JSON.stringify({ length, auth_token: token, use_proxy: true, proxies: document.getElementById('gunsProxies').value.trim() }),
                     signal: abortController.signal,
                 });
 
