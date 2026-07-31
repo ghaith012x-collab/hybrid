@@ -620,6 +620,19 @@ def _send_playwright_view(target_url, proxy_url):
                 extra_http_headers={"Accept-Language": "en-US,en;q=0.9", "Referer": "https://www.google.com/"},
             )
             page = context.new_page()
+            # guns.lol counts a view when its analytics beacon fires on page load
+            # (sa.guns.lol/simple.gif?...type=pageview). Detecting it is hard proof the view registered.
+            beacons = []
+
+            def _track_beacon(r):
+                try:
+                    u = r.url
+                    if "sa.guns.lol" in u or ("simple.gif" in u and "pageview" in u):
+                        beacons.append(u)
+                except Exception:
+                    pass
+
+            page.on("response", _track_beacon)
             t0 = time.time()
             resp = page.goto(target_url, timeout=30000, wait_until="domcontentloaded")
             # human-ish behavior: scroll, dwell
@@ -652,10 +665,12 @@ def _send_playwright_view(target_url, proxy_url):
                     except Exception:
                         new_title = ""
                     if not any(m in new_title for m in CHALLENGE_MARKERS):
-                        return True, f"Challenge cleared · {time.time()-t0:.1f}s · real browser"
+                        beacon_tag = " · beacon ✓ view registered" if beacons else " · ⚠ no analytics beacon"
+                        return True, f"Challenge cleared · {time.time()-t0:.1f}s · real browser{beacon_tag}"
                 return False, "Blocked by challenge/Cloudflare"
             context.close()
-            return True, f"HTTP {status or 200} · {time.time()-t0:.1f}s · real browser"
+            beacon_tag = " · beacon ✓ view registered" if beacons else " · ⚠ no analytics beacon"
+            return True, f"HTTP {status or 200} · {time.time()-t0:.1f}s · real browser{beacon_tag}"
         finally:
             try:
                 browser.close()
@@ -1111,6 +1126,50 @@ def bot_status():
 def view_count():
     with VIEW_LOCK:
         return jsonify({"views": BOT_STATE.get("views_sent", 0)})
+
+
+@app.route("/verify_views", methods=["POST"])
+def verify_views():
+    """Self-test: load the target N times with the real engine and report whether
+    guns.lol's own analytics beacon fires — that's what increments the view counter."""
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
+    count = max(1, min(int(data.get("views", 3)), 6))
+    if not url or not url.startswith(("http://", "https://")):
+        return jsonify({"error": "valid url required"}), 400
+
+    engine = probe_engine(block=True, timeout=60)
+    results, ok_count, beacon_count = [], 0, 0
+    for _ in range(count):
+        try:
+            if engine == "playwright":
+                ok, detail = _send_playwright_view(url, None)
+            elif engine == "chrome":
+                ok, detail = _send_chrome_view(url, None)
+            else:
+                ok, detail = _send_requests_view(url, None)
+        except Exception as e:
+            ok, detail = False, f"{type(e).__name__}: {str(e)[:120]}"
+        results.append({"ok": ok, "detail": detail})
+        if ok:
+            ok_count += 1
+            if "beacon" in detail and "⚠" not in detail:
+                beacon_count += 1
+        time.sleep(1.5)
+
+    if beacon_count > 0:
+        verdict = "Views ARE being registered — guns.lol's analytics beacon fired on successful loads."
+    elif ok_count > 0:
+        verdict = "Pages load but no analytics beacon detected — views may NOT be counted (IP likely gated)."
+    else:
+        verdict = "No views loaded — check the target URL and engine."
+    return jsonify({
+        "engine": engine,
+        "ok_count": ok_count,
+        "beacon_count": beacon_count,
+        "results": results,
+        "verdict": verdict,
+    })
 
 
 @app.route("/status")

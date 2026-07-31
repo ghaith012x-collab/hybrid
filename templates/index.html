@@ -320,6 +320,13 @@
             background: rgba(237,66,69,0.1); color: #ff6b6e;
             border: 1px solid rgba(237,66,69,0.35); font-size: 13px; line-height: 1.45;
         }
+        .verify-result {
+            margin-top: 10px; padding: 10px 12px; border-radius: 8px;
+            background: var(--surface2); border: 1px solid var(--border);
+            font-size: 13px; line-height: 1.5; white-space: pre-wrap; color: var(--muted);
+        }
+        .verify-result.good { color: var(--green); border-color: rgba(59,165,92,0.45); background: rgba(59,165,92,0.06); }
+        .verify-result.bad { color: var(--red); border-color: rgba(237,66,69,0.45); background: rgba(237,66,69,0.06); }
 
         .stat-grid {
             display: grid;
@@ -456,7 +463,9 @@
             <div class="btn-row">
                 <button class="btn-danger" id="btnStartGuns" onclick="startGuns()">&#x1F680; Start Bot</button>
                 <button class="btn-outline" id="btnStopGuns" onclick="stopGuns()" disabled>Stop</button>
+                <button class="btn-outline" id="btnVerifyViews" onclick="verifyViews()">&#x1F50D; Verify views</button>
             </div>
+            <div class="verify-result" id="verifyResult" style="display:none"></div>
 
             <div class="engine-badge idle" id="engineBadge">Engine: detecting...</div>
             <div class="tor-warning" id="torWarning" style="display:none">&#x26A0;&#xFE0F; <strong>Target is blocking Tor exit IPs (403)</strong> — Tor views won't count on this target. The bot switched to your proxies/direct. Paste residential proxies below for real views.</div>
@@ -776,6 +785,39 @@
         }
 
         // ── guns.lol bot ──
+        async function verifyViews() {
+            const url = document.getElementById('gunsUrl').value.trim();
+            const btn = document.getElementById('btnVerifyViews');
+            const box = document.getElementById('verifyResult');
+            if (!url.startsWith('http')) {
+                box.style.display = 'block';
+                box.className = 'verify-result bad';
+                box.textContent = 'Enter a valid target URL first.';
+                return;
+            }
+            btn.disabled = true;
+            box.style.display = 'block';
+            box.className = 'verify-result';
+            box.textContent = 'Running 3 real browser views \u2026 this takes a few seconds per view.';
+            try {
+                const r = await fetch('/verify_views', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url, views: 3 })
+                });
+                const d = await r.json();
+                if (d.error) { box.className = 'verify-result bad'; box.textContent = d.error; return; }
+                const lines = d.results.map((x, i) => `  ${i + 1}. ${x.ok ? 'OK ' : 'FAIL'} ${x.detail}`).join('\n');
+                box.className = `verify-result ${d.beacon_count > 0 ? 'good' : 'bad'}`;
+                box.textContent = `${d.ok_count}/${d.results.length} loads OK \u00b7 ${d.beacon_count} fired guns.lol's analytics beacon\n${d.verdict}\n${lines}`;
+            } catch (e) {
+                box.className = 'verify-result bad';
+                box.textContent = 'Verify failed: ' + e;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
         async function startGuns() {
             const url = document.getElementById('gunsUrl').value.trim();
             const browsers = parseInt(document.getElementById('browserCount').value) || 3;
