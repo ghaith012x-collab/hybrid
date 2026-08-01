@@ -665,6 +665,41 @@ GATE_TEXT_MARKERS = (
     "enter the profile", "show profile", "click to unlock",
 )
 
+# X / close buttons (popups, modals, overlays) to dismiss before clicking through.
+CLOSE_BUTTON_SELECTORS = (
+    "[aria-label=\"Close\"]",
+    "[aria-label=\"close\"]",
+    "[aria-label=\"Close dialog\"]",
+    "button[class*=\"close\"]",
+    "button[class*=\"Close\"]",
+    ".close",
+    ".close-btn",
+    ".modal-close",
+    "[data-close]",
+    "[data-testid=\"close\"]",
+    "button:has-text(\"✕\")",
+    "button:has-text(\"×\")",
+    "svg[aria-label=\"Close\"]",
+)
+
+
+def _click_close_buttons(page):
+    """Click any X / close button on the page (popups, modals, overlays)."""
+    clicked = 0
+    for sel in CLOSE_BUTTON_SELECTORS:
+        try:
+            els = page.query_selector_all(sel)
+            for e in els[:3]:
+                try:
+                    if e.is_visible():
+                        e.click(timeout=1500)
+                        clicked += 1
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return clicked
+
 
 def _find_gate_element(page):
     """Find the 'Click to enter' gate element if it's mounted and visible."""
@@ -707,59 +742,52 @@ def _snap_cam_chrome(cam_id, driver, label):
 
 
 def _click_through_gate(page, width, height, on_frame=None):
-    """Click guns.lol's 'Click to enter' overlay like a human: ~3s after load,
-    then click (gate element, else page center) 5 times, 4s apart.
-    Calls on_frame(label) between clicks so the live cam shows a frame every ~2s.
+    """guns.lol shows a 'Click to enter' gate. Dismiss any popups (X buttons),
+    wait ~3s, then click the gate ONCE (or the page center).
     Returns (clicks_done, gate_found)."""
-    # 3s pre-click wait, fed to the cam at 1.5s intervals.
-    for _ in range(2):
+    if on_frame:
         try:
-            page.wait_for_timeout(1500)
+            on_frame("closing popups")
         except Exception:
             pass
-        if on_frame:
-            try:
-                on_frame("gate: waiting")
-            except Exception:
-                pass
+    try:
+        _click_close_buttons(page)
+    except Exception:
+        pass
+    try:
+        page.wait_for_timeout(3000)
+    except Exception:
+        pass
     clicks = 0
     gate_found = False
-    for i in range(5):
-        try:
-            el = _find_gate_element(page)
-            if el is not None:
-                gate_found = True
-                box = el.bounding_box()
-                if box and box.get("width") and box.get("height"):
-                    page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-                else:
-                    page.mouse.click(width // 2, height // 2)
+    try:
+        el = _find_gate_element(page)
+        if el is not None:
+            gate_found = True
+            box = el.bounding_box()
+            if box and box.get("width") and box.get("height"):
+                page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
             else:
                 page.mouse.click(width // 2, height // 2)
-            clicks += 1
+        else:
+            page.mouse.click(width // 2, height // 2)
+        clicks = 1
+    except Exception:
+        try:
+            page.mouse.click(width // 2, height // 2)
+            clicks = 1
         except Exception:
-            try:
-                page.mouse.click(width // 2, height // 2)
-                clicks += 1
-            except Exception:
-                pass
-        if on_frame:
-            try:
-                on_frame(f"gate click {i+1}/5")
-            except Exception:
-                pass
-        if i < 4:
-            # Split the 4s gap in half so the cam gets a frame every 2s.
-            for _ in range(2):
-                try:
-                    page.wait_for_timeout(2000)
-                except Exception:
-                    pass
-                if on_frame:
-                    try:
-                        on_frame(f"gate clicked {i+1}/5")
-                    except Exception:
-                        pass
+            pass
+    # dismiss anything that popped up after the click
+    try:
+        _click_close_buttons(page)
+    except Exception:
+        pass
+    if on_frame:
+        try:
+            on_frame("gate clicked" if gate_found else "center clicked")
+        except Exception:
+            pass
     return clicks, gate_found
 
 
@@ -774,6 +802,9 @@ def _send_playwright_view(target_url, proxy_url, cam_id=None):
             "--disable-dev-shm-usage",
             "--disable-gpu",
             "--disable-blink-features=AutomationControlled",
+            "--disable-application-cache",
+            "--aggressive-cache-discard",
+            "--disable-features=BackForwardCache",
             "--lang=en-US",
         ],
     }
@@ -795,6 +826,12 @@ def _send_playwright_view(target_url, proxy_url, cam_id=None):
                 timezone_id=random.choice(["America/New_York", "Europe/London", "Asia/Tokyo", "Australia/Sydney"]),
                 extra_http_headers={"Accept-Language": "en-US,en;q=0.9", "Referer": "https://www.google.com/"},
             )
+            # fresh identity per view: wipe any cookies/storage so guns.lol can't
+            # dedupe this visit against a previous one from the same context.
+            try:
+                context.clear_cookies()
+            except Exception:
+                pass
             page = context.new_page()
             cam_id_str = str(cam_id) if cam_id is not None else None
 
@@ -941,19 +978,25 @@ def _send_chrome_view(target_url, proxy_url, cam_id=None):
             except Exception:
                 pass
             time.sleep(3)
-            for i in range(5):
-                try:
-                    els = driver.find_elements(By.XPATH, "//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'click to enter')]")
-                    if els:
-                        els[-1].click()
-                    else:
-                        driver.execute_script("document.elementFromPoint(960, 540).click();")
-                except Exception:
-                    pass
-                _snap_cam_chrome(cam_id, driver, f"gate click {i+1}/5")
-                time.sleep(2)
-                _snap_cam_chrome(cam_id, driver, f"gate clicked {i+1}/5")
-                time.sleep(2)
+            # dismiss X / close buttons, then click the gate once
+            try:
+                for xsel in ["[aria-label='Close']", "[aria-label='close']", "button[class*='close']", ".close", ".modal-close", "[data-close]"]:
+                    for el in driver.find_elements(By.CSS_SELECTOR, xsel):
+                        try:
+                            el.click()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            try:
+                els = driver.find_elements(By.XPATH, "//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'click to enter')]")
+                if els:
+                    els[-1].click()
+                else:
+                    driver.execute_script("document.elementFromPoint(960, 540).click();")
+            except Exception:
+                pass
+            _snap_cam_chrome(cam_id, driver, "gate clicked")
             gate_note = " · gate clicked"
         _snap_cam_chrome(cam_id, driver, "done")
         return True, f"Loaded in {time.time()-t0:.1f}s · real browser{gate_note}"
@@ -1024,6 +1067,7 @@ def guns_worker(target_url, proxies, worker_id, stop_event):
     tor_403_streak = 0
     tor_block_warned = False
     rate_limit_streak = 0
+    proxy_round = 0  # rotates through the proxy list so every view uses a fresh IP
 
     while not stop_event.is_set():
         # Re-derive the verified engine every round so an engine that just finished
@@ -1045,11 +1089,18 @@ def guns_worker(target_url, proxies, worker_id, stop_event):
                 else:
                     bot_log("warn", f"worker {worker_id+1} · Target blocks Tor exit IPs (403) — switching to direct. Tor views won't count on this target; add residential proxies for real views.")
 
-        proxy = proxies[worker_id % len(proxies)] if proxies else None
         if use_tor:
             proxy = f"socks5h://127.0.0.1:{9050 + tor_idx}"
             # Before every attempt, rotate the circuit so each view comes from a fresh exit IP.
             rotate_tor_circuit(tor_idx, verify_ip=False)
+        elif proxies:
+            # ROTATE: every view uses the NEXT proxy in the list so each load comes
+            # from a different IP. (guns.lol dedupes per unique session/IP — hammering
+            # one proxy means repeat views never count.)
+            proxy = proxies[(worker_id + proxy_round) % len(proxies)]
+            proxy_round += 1
+        else:
+            proxy = None
 
         # Single-IP direct mode: pace globally so a swarm of workers on one IP
         # doesn't burst-trigger the target's rate limiter and get gated.
@@ -1061,6 +1112,10 @@ def guns_worker(target_url, proxies, worker_id, stop_event):
         for attempt in range(max_retries):
             if stop_event.is_set():
                 return
+            # On a retry, also hop to the next proxy so a dead/blocked IP doesn't get reused.
+            if not use_tor and proxies and attempt > 0:
+                proxy = proxies[(worker_id + proxy_round) % len(proxies)]
+                proxy_round += 1
             try:
                 if engine == "playwright":
                     ok, detail = _send_playwright_view(target_url, proxy, cam_id=worker_id)
