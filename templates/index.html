@@ -764,8 +764,13 @@
                 });
 
                 if (!resp.ok) {
-                    const err = await resp.json();
-                    logEntry(log, `&#x274C; ${err.error}`, 'error');
+                    let err = {};
+                    try { err = await resp.json(); } catch (e) {}
+                    const message = err.error || `Checker request failed (HTTP ${resp.status})`;
+                    logEntry(log, `&#x274C; ${message}`, 'error');
+                    if (resp.status === 401) {
+                        logEntry(log, '&#x26A0;&#xFE0F; Discord independently rejected this token. Verify it again before retrying.', 'warn');
+                    }
                     return;
                 }
 
@@ -822,22 +827,23 @@
                 case 'progress':
                     break;
 
+                case 'warning':
+                    logEntry(log, `&#x26A0;&#xFE0F; ${event.message}`, 'warn');
+                    break;
+
                 case 'fatal':
                     logEntry(log, `&#x274C; FATAL — ${event.message}`, 'error');
                     if (event.status === 401) {
-                        logEntry(log, '&#x26A0;&#xFE0F; Your token was rejected. Get a fresh user token from Discord browser DevTools (Network tab &rarr; look for "authorization" header).', 'warn');
-                    }
-                    if (event.status === 429) {
-                        logEntry(log, '&#x26A0;&#xFE0F; Rate limited. Wait a few minutes and try again with fewer workers.', 'warn');
+                        logEntry(log, '&#x26A0;&#xFE0F; This is a confirmed token failure from Discord /users/@me. It is not a username-availability result.', 'warn');
                     }
                     break;
 
                 case 'complete':
                     bar.style.width = '100%';
                     if (event.available.length === 0) {
-                        logEntry(log, 'Done — no available usernames found.', 'progress');
+                        logEntry(log, `Done — no available usernames found in ${event.checked.toLocaleString()} definitive checks.`, 'progress');
                     } else {
-                        logEntry(log, `Done! Found ${event.available.length} available.`, 'progress');
+                        logEntry(log, `Done! Found ${event.available.length} available in ${event.checked.toLocaleString()} definitive checks.`, 'progress');
                     }
                     break;
             }

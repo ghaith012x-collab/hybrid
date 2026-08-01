@@ -352,41 +352,66 @@ def _check_token_valid(auth_token, ttl=60):
     return valid
 
 
-def _discord_err(code, err=""):
+def _discord_err(code, err="", *, fatal=None, retryable=None):
+    """Normalize Discord errors without making every transient response fatal."""
     if code == 401:
-        return {"available": None, "status": 401, "discord_msg": "Token rejected (401) — invalid or expired user token. Make sure it's a USER token, not a bot token."}
+        return {
+            "available": None,
+            "status": 401,
+            "discord_msg": "Token rejected (401) — /users/@me also rejected it. The token is invalid or expired.",
+            "fatal": True if fatal is None else fatal,
+            "retryable": False if retryable is None else retryable,
+        }
     if code == 429:
-        return {"available": None, "status": 429, "discord_msg": "Rate limited (429) — Discord is throttling requests"}
+        return {
+            "available": None,
+            "status": 429,
+            "discord_msg": "Rate limited (429) — Discord is throttling username checks",
+            "fatal": False if fatal is None else fatal,
+            "retryable": True if retryable is None else retryable,
+        }
     if code == 403:
-        return {"available": None, "status": 403, "discord_msg": "Forbidden (403) — token lacks permissions or account is flagged"}
-    return {"available": None, "status": code, "discord_msg": f"HTTP {code}: {err}"}
+        return {
+            "available": None,
+            "status": 403,
+            "discord_msg": "Username check blocked (403) — Discord rejected this route; retrying with another route",
+            "fatal": False if fatal is None else fatal,
+            "retryable": True if retryable is None else retryable,
+        }
+    transient = code is None or code >= 500
+    return {
+        "available": None,
+        "status": code,
+        "discord_msg": f"HTTP {code}: {err}",
+        "fatal": False if fatal is None else fatal,
+        "retryable": transient if retryable is None else retryable,
+    }
 
 
 def check_discord_username(username, auth_token, proxy_url=None, use_proxy=True):
-    """Returns {"available": bool|None, "status": int|None, "discord_msg": str|None}
+    """Check one username while separating token failures from route failures.
 
-    The DIRECT connection is tried first and is the judge of the token. A 401 from a
-    proxy/Tor exit is NOT conclusive — Discord's anti-abuse flags many exit IPs and
-    rejects even valid tokens through them. The proxy is only a fallback for
-    rate-limits (429) or connection failures on the direct route.
+    Direct is preferred. A 401 from /pomelo is only a token failure when the
+    independent /users/@me check also rejects the token; Discord frequently uses
+    401/403 to block a route while the token remains valid.
     """
     headers = _build_discord_headers(auth_token)
     payload = {"username": username}
 
-    def _do(s):
-        if s == "proxy":
-            return requests.post(
-                "https://discord.com/api/v9/users/@me/pomelo",
-                headers=headers, json=payload, timeout=10,
-                proxies={"http": proxy_url, "https": proxy_url},
-            )
-        return requests.post("https://discord.com/api/v9/users/@me/pomelo", headers=headers, json=payload, timeout=10)
+    def _do(strategy):
+        kwargs = {"headers": headers, "json": payload, "timeout": 10}
+        if strategy == "proxy":
+            kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+        return requests.post("https://discord.com/api/v9/users/@me/pomelo", **kwargs)
 
     def _verdict(resp):
         code = resp.status_code
         if code == 200:
-            data = resp.json()
-            return {"available": data.get("taken") is False, "status": 200, "discord_msg": None}
+            try:
+                data = resp.json()
+            except Exception:
+                return _discord_err(502, "invalid JSON from Discord", retryable=True)
+            return {"available": data.get("taken") is False, "status": 200, "discord_msg": None, "fatal": False, "retryable": False}
         try:
             body = resp.json()
             err = body.get("message", str(body))
@@ -400,38 +425,58 @@ def check_discord_username(username, auth_token, proxy_url=None, use_proxy=True)
 
     direct_verdict = None
     last_err = None
-    for s in strategies:
+    for strategy in strategies:
         try:
-            resp = _do(s)
-            v = _verdict(resp)
-            if v["status"] == 200:
-                return v
-            if s == "direct":
-                direct_verdict = v
-                if v["status"] == 401:
-                    # A pomelo 401 does NOT always mean a bad token — Discord's
-                    # anti-abuse flags many server IPs and returns 401 even for valid
-                    # tokens. Cross-check the token independently before condemning it.
+            verdict = _verdict(_do(strategy))
+            if verdict["status"] == 200:
+                return verdict
+
+            if strategy == "direct":
+                direct_verdict = verdict
+                if verdict["status"] == 401:
                     valid = _check_token_valid(auth_token)
-                    if valid is True:
-                        return {"available": None, "status": 401, "discord_msg": "Discord blocked this username check (HTTP 401) — your token is VALID, but Discord is flagging this server IP for username checking. Add residential proxies or run from a residential IP."}
                     if valid is False:
-                        return v  # genuinely bad token
-                    return {"available": None, "status": 401, "discord_msg": "Discord returned 401 on the username check — re-verify your token with the Verify button (token may be flagged/expired, or this IP is blocked for checking)."}
-                if v["status"] != 429:
-                    return v  # direct 403/other is conclusive
+                        return verdict  # genuinely invalid token: the only fatal 401
+                    if valid is True:
+                        # Do not stop here: use the supplied route before reporting an
+                        # IP-level block. This was the bug causing every scan to die.
+                        if use_proxy and proxy_url:
+                            continue
+                        return {
+                            "available": None,
+                            "status": None,
+                            "discord_msg": "Token is valid, but Discord blocked username checks from this IP (401). Add a working proxy or try again later.",
+                            "fatal": False,
+                            "retryable": True,
+                        }
+                    return {
+                        "available": None,
+                        "status": None,
+                        "discord_msg": "Discord could not distinguish a token failure from an IP block. Re-verify the token and retry.",
+                        "fatal": False,
+                        "retryable": True,
+                    }
+                # 429/403/5xx are route problems; try the supplied route.
+                if verdict.get("retryable") and use_proxy and proxy_url:
+                    continue
+                last_err = verdict
             else:
-                if v["status"] in (401, 403, 500, 502, 503, 504):
-                    last_err = {"available": None, "status": v["status"], "discord_msg": f"Proxy attempt failed (HTTP {v['status']}) — proxy/Tor exit likely flagged by Discord"}
-                else:
-                    last_err = v
+                last_err = {
+                    **verdict,
+                    "fatal": False,
+                    "retryable": True,
+                    "discord_msg": f"Proxy route failed ({verdict.get('status')}) — trying another route",
+                }
         except requests.exceptions.Timeout:
-            last_err = {"available": None, "status": None, "discord_msg": "Timed out — Discord unreachable"}
-        except Exception as e:
-            last_err = {"available": None, "status": None, "discord_msg": f"Connection error: {str(e)[:150]}"}
-    if direct_verdict:
-        return direct_verdict
-    return last_err or {"available": None, "status": None, "discord_msg": "All connection attempts failed"}
+            last_err = {"available": None, "status": None, "discord_msg": "Timed out — Discord unreachable", "fatal": False, "retryable": True}
+        except requests.exceptions.RequestException as exc:
+            last_err = {"available": None, "status": None, "discord_msg": f"Connection error — {type(exc).__name__}", "fatal": False, "retryable": True}
+        except Exception as exc:
+            last_err = {"available": None, "status": None, "discord_msg": f"Unexpected checker error — {type(exc).__name__}", "fatal": False, "retryable": False}
+
+    if last_err:
+        return last_err
+    return direct_verdict or {"available": None, "status": None, "discord_msg": "No response from Discord", "fatal": False, "retryable": True}
 
 
 # ── guns.lol view bot engine ───────────────────────────────────────────
@@ -1240,7 +1285,10 @@ def validate_token():
 @app.route("/check_usernames", methods=["POST"])
 def check_usernames():
     data = request.get_json(silent=True) or {}
-    length = int(data.get("length", 3))
+    try:
+        length = int(data.get("length", 3))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Length must be 2, 3, or 4"}), 400
     auth_token = (data.get("auth_token") or "").strip()
     proxy_list = _normalize_proxies(data.get("proxies"))
     use_proxy = bool(proxy_list) and bool(data.get("use_proxy", True))
@@ -1249,6 +1297,13 @@ def check_usernames():
         return jsonify({"error": "Discord auth token is required"}), 400
     if length not in (2, 3, 4):
         return jsonify({"error": "Length must be 2, 3, or 4"}), 400
+
+    # Do not start thousands of checks with a stale/invalid token. A temporary
+    # failure to validate is not treated as invalid; each username check will
+    # classify that route failure independently.
+    token_state = _check_token_valid(auth_token, ttl=15)
+    if token_state is False:
+        return jsonify({"error": "Token rejected by Discord /users/@me — it is invalid or expired."}), 401
 
     letters = string.ascii_lowercase
     combinations = ["".join(p) for p in itertools.product(letters, repeat=length)]
@@ -1260,23 +1315,64 @@ def check_usernames():
     checked_count = [0]
     available_list = []
     fatal_error = [None]
+    stats_lock = threading.Lock()
+    fatal_lock = threading.Lock()
+    warning_sent = [False]
 
-    def worker(combo_batch, proxy_url):
-        for combo in combo_batch:
+    def worker(combo_batch, worker_id):
+        for position, combo in enumerate(combo_batch):
             if stop_event.is_set():
                 return
-            pace_requests(min_interval=0.4)  # aggregate rate cap (~2.5 req/s)
-            res = check_discord_username(combo, auth_token, proxy_url, use_proxy)
-            checked_count[0] += 1
 
-            if res["available"] is True:
-                available_list.append(combo)
+            # A route can be rate-limited or blocked even when the token is valid.
+            # Retry the same name a few times, rotating to the next supplied proxy
+            # on every attempt, then skip it and continue instead of killing the run.
+            res = None
+            for attempt in range(3):
+                if stop_event.is_set():
+                    return
+                proxy_url = None
+                if use_proxy and proxy_list:
+                    proxy_url = proxy_list[(worker_id + position + attempt) % len(proxy_list)]
+                pace_requests(min_interval=0.65)
+                res = check_discord_username(combo, auth_token, proxy_url, use_proxy)
+                if not res.get("retryable") or res.get("available") is not None:
+                    break
+                if attempt < 2:
+                    time.sleep(1.0 + attempt * 1.5)
+
+            if res is None:
+                res = {"available": None, "status": None, "discord_msg": "No response", "fatal": False, "retryable": True}
+
+            with stats_lock:
+                checked_count[0] += 1
+
+            if res.get("available") is True:
+                with stats_lock:
+                    available_list.append(combo)
                 result_queue.put({"type": "found", "username": combo})
-            elif res["status"] is not None and res["status"] >= 400:
-                fatal_error[0] = res["discord_msg"]
-                result_queue.put({"type": "fatal", "message": res["discord_msg"], "status": res["status"]})
-                stop_event.set()
+            elif res.get("fatal"):
+                # Only a separately confirmed invalid token is fatal. Guard this so
+                # five workers cannot emit five different fatal events at once.
+                with fatal_lock:
+                    if fatal_error[0] is None:
+                        fatal_error[0] = res.get("discord_msg") or "Discord rejected the token"
+                        result_queue.put({
+                            "type": "fatal",
+                            "message": fatal_error[0],
+                            "status": res.get("status"),
+                        })
+                        stop_event.set()
                 return
+            elif res.get("retryable"):
+                with fatal_lock:
+                    if not warning_sent[0]:
+                        warning_sent[0] = True
+                        result_queue.put({
+                            "type": "warning",
+                            "message": "Discord is limiting or blocking username checks from the current route; continuing with retries/proxies. Some names may remain unchecked.",
+                        })
+
         result_queue.put({"type": "done"})
 
     num_workers = min(5, len(combinations))
@@ -1287,8 +1383,7 @@ def check_usernames():
         start_idx = i * batch_size
         end_idx = start_idx + batch_size if i < num_workers - 1 else total
         batch = combinations[start_idx:end_idx]
-        proxy = proxy_list[i % len(proxy_list)] if proxy_list else None
-        t = threading.Thread(target=worker, args=(batch, proxy), daemon=True)
+        t = threading.Thread(target=worker, args=(batch, i), daemon=True)
         threads.append(t)
         t.start()
 
@@ -1301,7 +1396,9 @@ def check_usernames():
                     yield f"data: {json.dumps({'event': 'found', 'username': msg['username'], 'checked': checked_count[0], 'total': total})}\n\n"
                 elif msg["type"] == "fatal":
                     yield f"data: {json.dumps({'event': 'fatal', 'message': msg['message'], 'status': msg.get('status'), 'checked': checked_count[0], 'total': total})}\n\n"
-                    done_workers = num_workers
+                    return
+                elif msg["type"] == "warning":
+                    yield f"data: {json.dumps({'event': 'warning', 'message': msg['message'], 'checked': checked_count[0], 'total': total})}\n\n"
                 elif msg["type"] == "done":
                     done_workers += 1
             except queue.Empty:
