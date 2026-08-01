@@ -501,21 +501,17 @@
         <!-- ── Discord checker ── -->
         <div class="card">
             <h2>&#x1F50D; Username Checker</h2>
-            <p class="sub">Paste your Discord <strong>user token</strong> (from browser DevTools), then check availability. If Discord blocks this server's IP (HTTP 401), paste residential proxies in the guns.lol card below &mdash; the checker uses them too.</p>
+            <p class="sub">Browser-based checker &mdash; types usernames into discord.com/register form. <strong>No token needed.</strong> Uses letters + digits. 5 workers in parallel. Browsers recycle every 20 checks for clean IP/cache. Add proxies below for better results.</p>
 
             <div class="input-group">
-                <label>Discord User Token</label>
-                <div class="input-row">
-                    <input type="password" id="authToken" placeholder="Paste your Discord user token..." oninput="tokenChanged()">
-                    <button class="btn-sm btn-outline" id="btnValidate" onclick="validateToken()" disabled>Verify</button>
-                </div>
-                <div class="token-status" id="tokenStatus"></div>
+                <label>How it works</label>
+                <p class="sub" style="margin:0;font-size:0.78em;">Opens discord.com/register in a real browser, types each username, and reads Discord's own availability check. <strong>No token needed.</strong> 5 browsers run in parallel. Uses letters + numbers. Browsers recycle every 20 checks for fresh IP/cache.</p>
             </div>
 
             <div class="btn-row">
-                <button class="btn-primary" id="btn2" onclick="startCheck(2)" disabled>2 Letters (676)</button>
-                <button class="btn-primary" id="btn3" onclick="startCheck(3)" disabled>3 Letters (17k)</button>
-                <button class="btn-primary" id="btn4" onclick="startCheck(4)" disabled>4 Letters (456k)</button>
+                <button class="btn-primary" id="btn2" onclick="startCheck(2)">2 chars (1.3k)</button>
+                <button class="btn-primary" id="btn3" onclick="startCheck(3)">3 chars (46k)</button>
+                <button class="btn-primary" id="btn4" onclick="startCheck(4)">4 chars (1.6M)</button>
                 <button class="btn-outline" id="btnStop" onclick="stopCheck()" disabled>Stop</button>
             </div>
 
@@ -586,7 +582,7 @@
     <script>
         let abortController = null;
         let checking = false;
-        let tokenValid = false;
+
         let foundUsernames = [];
         let viewInterval = null;
         let botInterval = null;
@@ -715,67 +711,11 @@
             return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
         }
 
-        // ── Token validation ──
-        function tokenChanged() {
-            tokenValid = false;
-            const inp = document.getElementById('authToken');
-            const btn = document.getElementById('btnValidate');
-            const st = document.getElementById('tokenStatus');
-            inp.classList.remove('valid', 'invalid');
-            st.textContent = '';
-            st.className = 'token-status';
-            btn.disabled = !inp.value.trim();
-            document.querySelectorAll('#btn2, #btn3, #btn4').forEach(b => b.disabled = true);
-        }
-
-        async function validateToken() {
-            const inp = document.getElementById('authToken');
-            const st = document.getElementById('tokenStatus');
-            const token = inp.value.trim();
-            if (!token) return;
-
-            st.innerHTML = '<span class="spinner"></span> Checking...';
-            st.className = 'token-status';
-            inp.classList.remove('valid', 'invalid');
-
-            try {
-                const r = await fetch('/validate_token', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ auth_token: token }),
-                });
-                const d = await r.json();
-                if (d.valid) {
-                    st.innerHTML = `&#x2705; Valid! Logged in as <strong>${d.username}</strong>`;
-                    st.className = 'token-status ok';
-                    inp.classList.add('valid');
-                    tokenValid = true;
-                    document.querySelectorAll('#btn2, #btn3, #btn4').forEach(b => b.disabled = false);
-                } else {
-                    st.innerHTML = `&#x274C; ${d.error}`;
-                    st.className = 'token-status bad';
-                    inp.classList.add('invalid');
-                    tokenValid = false;
-                }
-            } catch (e) {
-                st.innerHTML = `&#x274C; Could not reach server`;
-                st.className = 'token-status bad';
-            }
-        }
-
-        document.getElementById('authToken').addEventListener('keydown', function(e) {
-            if (e.key === 'Enter') validateToken();
-        });
+        // ── No token needed — checker uses browser-based register form ──
 
         // ── Username checker ──
         async function startCheck(length) {
             if (checking) return;
-            if (!tokenValid) {
-                toast('Validate your token first by clicking "Verify".');
-                return;
-            }
-
-            const token = document.getElementById('authToken').value.trim();
             checking = true;
             foundUsernames = [];
             abortController = new AbortController();
@@ -808,7 +748,7 @@
                 const resp = await fetch('/check_usernames', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ length, auth_token: token, use_proxy: true, proxies: document.getElementById('gunsProxies').value.trim() }),
+                    body: JSON.stringify({ length, use_proxy: true, proxies: document.getElementById('gunsProxies').value.trim() }),
                     signal: abortController.signal,
                 });
 
@@ -851,9 +791,7 @@
                 checking = false;
                 btnStop.disabled = true;
                 abortController = null;
-                if (tokenValid) {
-                    document.querySelectorAll('#btn2, #btn3, #btn4').forEach(b => b.disabled = false);
-                }
+                document.querySelectorAll('#btn2, #btn3, #btn4').forEach(b => b.disabled = false);
             }
         }
 

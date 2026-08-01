@@ -291,193 +291,183 @@ def tor_target_probe(target_url, max_instances=2):
     return None, "inconclusive"
 
 
-# ── Discord checker ────────────────────────────────────────────────────
+# ── Discord checker (browser-based, no token) ──────────────────────────
 
-def _build_discord_headers(auth_token):
-    return {
-        "authority": "discord.com",
-        "accept": "*/*",
-        "accept-encoding": "gzip, deflate, br",
-        "accept-language": "en-US,en;q=0.9",
-        "authorization": auth_token,
-        "content-type": "application/json",
-        "origin": "https://discord.com",
-        "referer": "https://discord.com/channels/@me",
-        "sec-ch-ua": '"Not_A Brand";v="99", "Google Chrome";v="109", "Chromium";v="109"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36",
-        "x-debug-options": "bugReporterEnabled",
-        "x-discord-locale": "en-US",
-        "x-discord-timezone": "America/New_York",
-        "x-super-properties": (
-            "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21lIiwiZGV2aWNlIjoiIiwic3lzdGVtX2xvY2FsZSI6ImVuLVVTIiwiYnJvd3Nlcl91c2VyX2FnZW50IjoiTW96aWxsYS81LjAg"
-            "KFdpbmRvd3MgTlQgMTAuMDsgV2luNjQ7IHg2NCkgQXBwbGVXZWJLaXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzEwOS4wLjAuMCBTYWZhcmkvNTM3LjM2I"
-            "iwiYnJvd3Nlcl92ZXJzaW9uIjoiMTA5LjAuMC4wIiwib3NfdmVyc2lvbiI6IjEwIiwicmVmZXJyZXIiOiJodHRwczovL3d3dy5nb29nbGUuY29tLyIsInJlZmVycmluZ19kb21ha"
-            "W4iOiJ3d3cuZ29vZ2xlLmNvbSIsInNlYXJjaF9lbmdpbmUiOiJnb29nbGUiLCJyZWZlcnJlcl9jdXJyZW50IjoiIiwicmVmZXJyaW5nX2RvbWFpbl9jdXJyZW50IjoiIiwicmVs"
-            "ZWFzZV9jaGFubmVsIjoic3RhYmxlIiwiY2xpZW50X2J1aWxkX251bWJlciI6MTc1OTE3LCJjbGllbnRfZXZlbnRfc291cmNlIjpudWxsfQ=="
-        ),
-    }
+# Discord register page username input selectors (tried in order)
+DISCORD_USERNAME_SELECTORS = [
+    "input[name='username']",
+    "input[aria-label*='username' i]",
+    "input[aria-label*='display' i]",
+    "input[type='text']:not([name='email']):not([aria-label*='email' i])",
+]
+
+# Text markers that indicate a username is TAKEN (unavailable)
+DISCORD_UNAVAILABLE_MARKERS = [
+    "unavailable",
+    "username is unavailable",
+    "you can't use this username",
+    "already taken",
+    "too many users have this username",
+]
+
+# Text markers that indicate a username is AVAILABLE
+DISCORD_AVAILABLE_MARKERS = [
+    "you're good to go",
+    "username is available",
+    "available",
+]
 
 
-# ── Token validity cross-check (pomelo 401 ≠ bad token — Discord flags IPs) ──
-TOKEN_CHECK_CACHE = {}
-TOKEN_CHECK_LOCK = threading.Lock()
+def _check_username_via_register(username, proxy_url=None, cam_id=None):
+    """Check one Discord username by filling the register form in a real browser.
 
+    Navigates to https://discord.com/register, types the username, waits for
+    Discord's inline validation, and reads whether it shows 'unavailable' or
+    the green 'available' indicator.
 
-def _check_token_valid(auth_token, ttl=60):
-    """GET /users/@me to independently verify the token (cached briefly).
-
-    Returns True (valid), False (invalid), or None (couldn't tell)."""
-    if not auth_token:
-        return False
-    with TOKEN_CHECK_LOCK:
-        hit = TOKEN_CHECK_CACHE.get(auth_token)
-        if hit and time.time() - hit[0] < ttl:
-            return hit[1]
-    try:
-        resp = requests.get(
-            "https://discord.com/api/v9/users/@me",
-            headers=_build_discord_headers(auth_token),
-            timeout=10,
-        )
-        valid = resp.status_code == 200
-    except Exception:
-        valid = None
-    with TOKEN_CHECK_LOCK:
-        TOKEN_CHECK_CACHE[auth_token] = (time.time(), valid)
-    return valid
-
-
-def _discord_err(code, err="", *, fatal=None, retryable=None):
-    """Normalize Discord errors without making every transient response fatal."""
-    if code == 401:
-        return {
-            "available": None,
-            "status": 401,
-            "discord_msg": "Token rejected (401) — /users/@me also rejected it. The token is invalid or expired.",
-            "fatal": True if fatal is None else fatal,
-            "retryable": False if retryable is None else retryable,
-        }
-    if code == 429:
-        return {
-            "available": None,
-            "status": 429,
-            "discord_msg": "Rate limited (429) — Discord is throttling username checks",
-            "fatal": False if fatal is None else fatal,
-            "retryable": True if retryable is None else retryable,
-        }
-    if code == 403:
-        return {
-            "available": None,
-            "status": 403,
-            "discord_msg": "Username check blocked (403) — Discord rejected this route; retrying with another route",
-            "fatal": False if fatal is None else fatal,
-            "retryable": True if retryable is None else retryable,
-        }
-    transient = code is None or code >= 500
-    return {
-        "available": None,
-        "status": code,
-        "discord_msg": f"HTTP {code}: {err}",
-        "fatal": False if fatal is None else fatal,
-        "retryable": transient if retryable is None else retryable,
-    }
-
-
-def check_discord_username(username, auth_token, proxy_url=None, use_proxy=True):
-    """Check one username while separating token failures from route failures.
-
-    Direct is preferred. A 401 from /pomelo is only a token failure when the
-    independent /users/@me check also rejects the token; Discord frequently uses
-    401/403 to block a route while the token remains valid.
+    Returns {"available": bool|None, "detail": str}
     """
-    headers = _build_discord_headers(auth_token)
-    payload = {"username": username}
+    from playwright.sync_api import sync_playwright
 
-    def _do(strategy):
-        kwargs = {"headers": headers, "json": payload, "timeout": 10}
-        if strategy == "proxy":
-            kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
-        return requests.post("https://discord.com/api/v9/users/@me/pomelo", **kwargs)
+    ua = random.choice(USER_AGENTS)
+    viewport = random.choice([(1366, 768), (1440, 900), (1536, 864), (1920, 1080), (1280, 720)])
 
-    def _verdict(resp):
-        code = resp.status_code
-        if code == 200:
+    launch_opts = {
+        "headless": True,
+        "args": [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-application-cache",
+            "--aggressive-cache-discard",
+            "--disable-features=BackForwardCache",
+            "--lang=en-US",
+        ],
+    }
+    if proxy_url:
+        server, user, pw = _browser_proxy(proxy_url)
+        if server:
+            launch_opts["proxy"] = {"server": server}
+            if user:
+                launch_opts["proxy"]["username"] = user
+            if pw:
+                launch_opts["proxy"]["password"] = pw
+
+    t0 = time.time()
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(**launch_opts)
             try:
-                data = resp.json()
-            except Exception:
-                return _discord_err(502, "invalid JSON from Discord", retryable=True)
-            return {"available": data.get("taken") is False, "status": 200, "discord_msg": None, "fatal": False, "retryable": False}
-        try:
-            body = resp.json()
-            err = body.get("message", str(body))
-        except Exception:
-            err = resp.text[:200]
-        return _discord_err(code, err)
+                context = browser.new_context(
+                    user_agent=ua,
+                    viewport={"width": viewport[0], "height": viewport[1]},
+                    locale="en-US",
+                    timezone_id=random.choice(["America/New_York", "Europe/London", "Asia/Tokyo", "Australia/Sydney"]),
+                    extra_http_headers={"Accept-Language": "en-US,en;q=0.9", "Referer": "https://www.google.com/"},
+                )
+                try:
+                    context.clear_cookies()
+                except Exception:
+                    pass
 
-    strategies = ["direct"]
-    if use_proxy and proxy_url:
-        strategies.append("proxy")
+                page = context.new_page()
+                resp = page.goto("https://discord.com/register", timeout=30000, wait_until="domcontentloaded")
+                page.wait_for_timeout(2000)
 
-    direct_verdict = None
-    last_err = None
-    for strategy in strategies:
-        try:
-            verdict = _verdict(_do(strategy))
-            if verdict["status"] == 200:
-                return verdict
+                input_el = None
+                for sel in DISCORD_USERNAME_SELECTORS:
+                    try:
+                        el = page.query_selector(sel)
+                        if el and el.is_visible():
+                            input_el = el
+                            break
+                    except Exception:
+                        continue
 
-            if strategy == "direct":
-                direct_verdict = verdict
-                if verdict["status"] == 401:
-                    valid = _check_token_valid(auth_token)
-                    if valid is False:
-                        return verdict  # genuinely invalid token: the only fatal 401
-                    if valid is True:
-                        # Do not stop here: use the supplied route before reporting an
-                        # IP-level block. This was the bug causing every scan to die.
-                        if use_proxy and proxy_url:
+                if input_el is None:
+                    try:
+                        all_inputs = page.query_selector_all("input[type='text']")
+                        for inp in all_inputs:
+                            try:
+                                if inp.is_visible():
+                                    input_el = inp
+                                    break
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+
+                if input_el is None:
+                    context.close()
+                    return {"available": None, "detail": "Could not find username input on register page"}
+
+                try:
+                    input_el.click()
+                    page.wait_for_timeout(300)
+                    input_el.fill("")
+                    page.wait_for_timeout(200)
+                    input_el.type(username, delay=random.randint(40, 100))
+                except Exception:
+                    context.close()
+                    return {"available": None, "detail": "Could not type username into register form"}
+
+                page.wait_for_timeout(random.randint(1800, 3000))
+
+                try:
+                    body_text = (page.content() or "").lower()
+                except Exception:
+                    body_text = ""
+
+                for marker in DISCORD_UNAVAILABLE_MARKERS:
+                    if marker in body_text:
+                        context.close()
+                        elapsed = time.time() - t0
+                        return {"available": False, "detail": f"Taken ({marker}) · {elapsed:.1f}s"}
+
+                for marker in DISCORD_AVAILABLE_MARKERS:
+                    if marker in body_text:
+                        context.close()
+                        elapsed = time.time() - t0
+                        return {"available": True, "detail": f"Available · {elapsed:.1f}s"}
+
+                try:
+                    aria_invalid = input_el.get_attribute("aria-invalid")
+                    if aria_invalid == "true":
+                        context.close()
+                        elapsed = time.time() - t0
+                        return {"available": False, "detail": f"Taken (aria-invalid=true) · {elapsed:.1f}s"}
+                except Exception:
+                    pass
+
+                try:
+                    error_els = page.query_selector_all("[class*='error'], [class*='Error'], [class*='invalid']")
+                    for e in error_els:
+                        try:
+                            txt = (e.text_content() or "").lower()
+                            if any(m in txt for m in DISCORD_UNAVAILABLE_MARKERS):
+                                context.close()
+                                elapsed = time.time() - t0
+                                return {"available": False, "detail": f"Taken (error element) · {elapsed:.1f}s"}
+                        except Exception:
                             continue
-                        return {
-                            "available": None,
-                            "status": None,
-                            "discord_msg": "Token is valid, but Discord blocked username checks from this IP (401). Add a working proxy or try again later.",
-                            "fatal": False,
-                            "retryable": True,
-                        }
-                    return {
-                        "available": None,
-                        "status": None,
-                        "discord_msg": "Discord could not distinguish a token failure from an IP block. Re-verify the token and retry.",
-                        "fatal": False,
-                        "retryable": True,
-                    }
-                # 429/403/5xx are route problems; try the supplied route.
-                if verdict.get("retryable") and use_proxy and proxy_url:
-                    continue
-                last_err = verdict
-            else:
-                last_err = {
-                    **verdict,
-                    "fatal": False,
-                    "retryable": True,
-                    "discord_msg": f"Proxy route failed ({verdict.get('status')}) — trying another route",
-                }
-        except requests.exceptions.Timeout:
-            last_err = {"available": None, "status": None, "discord_msg": "Timed out — Discord unreachable", "fatal": False, "retryable": True}
-        except requests.exceptions.RequestException as exc:
-            last_err = {"available": None, "status": None, "discord_msg": f"Connection error — {type(exc).__name__}", "fatal": False, "retryable": True}
-        except Exception as exc:
-            last_err = {"available": None, "status": None, "discord_msg": f"Unexpected checker error — {type(exc).__name__}", "fatal": False, "retryable": False}
+                except Exception:
+                    pass
 
-    if last_err:
-        return last_err
-    return direct_verdict or {"available": None, "status": None, "discord_msg": "No response from Discord", "fatal": False, "retryable": True}
+                context.close()
+                elapsed = time.time() - t0
+                return {"available": False, "detail": f"Likely taken (no availability indicator) · {elapsed:.1f}s"}
 
+            finally:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
+    except Exception as e:
+        elapsed = time.time() - t0
+        msg = f"{type(e).__name__}: {str(e)[:120]}"
+        return {"available": None, "detail": f"Browser error: {msg} · {elapsed:.1f}s"}
 
 # ── guns.lol view bot engine ───────────────────────────────────────────
 
@@ -1250,63 +1240,31 @@ def index():
 
 @app.route("/validate_token", methods=["POST"])
 def validate_token():
-    data = request.get_json(silent=True) or {}
-    token = (data.get("auth_token") or "").strip()
-    if not token:
-        return jsonify({"valid": False, "error": "No token provided"})
-
-    headers = _build_discord_headers(token)
-    try:
-        resp = requests.get("https://discord.com/api/v9/users/@me", headers=headers, timeout=10)
-        if resp.status_code == 200:
-            user = resp.json()
-            return jsonify({
-                "valid": True,
-                "username": user.get("username"),
-                "discriminator": user.get("discriminator", "0"),
-                "id": user.get("id"),
-            })
-        if resp.status_code == 401:
-            return jsonify({"valid": False, "error": "Token rejected (401) — invalid or expired. Make sure it's a USER token from Discord's dev tools, not a bot token."})
-        if resp.status_code == 429:
-            return jsonify({"valid": False, "error": "Rate limited by Discord. Wait a minute and try again."})
-        try:
-            body = resp.json()
-            msg = body.get("message", str(resp.status_code))
-        except Exception:
-            msg = f"HTTP {resp.status_code}"
-        return jsonify({"valid": False, "error": msg})
-    except requests.exceptions.Timeout:
-        return jsonify({"valid": False, "error": "Timed out — Discord unreachable"})
-    except Exception as e:
-        return jsonify({"valid": False, "error": f"Connection error: {str(e)[:200]}"})
+    """Token validation is no longer needed — the checker uses browser-based registration form now."""
+    return jsonify({"valid": True, "username": "browser-mode", "note": "No token needed — checker uses discord.com/register via browser"})
 
 
 @app.route("/check_usernames", methods=["POST"])
 def check_usernames():
+    """Browser-based username checker — types names into discord.com/register form.
+
+    No token required. 5 browser workers. Numbers + letters. Every 20 checks
+    per worker, the browser restarts fresh (clear cache, new IP via proxy rotation).
+    """
     data = request.get_json(silent=True) or {}
     try:
         length = int(data.get("length", 3))
     except (TypeError, ValueError):
         return jsonify({"error": "Length must be 2, 3, or 4"}), 400
-    auth_token = (data.get("auth_token") or "").strip()
-    proxy_list = _normalize_proxies(data.get("proxies"))
-    use_proxy = bool(proxy_list) and bool(data.get("use_proxy", True))
-
-    if not auth_token:
-        return jsonify({"error": "Discord auth token is required"}), 400
     if length not in (2, 3, 4):
         return jsonify({"error": "Length must be 2, 3, or 4"}), 400
 
-    # Do not start thousands of checks with a stale/invalid token. A temporary
-    # failure to validate is not treated as invalid; each username check will
-    # classify that route failure independently.
-    token_state = _check_token_valid(auth_token, ttl=15)
-    if token_state is False:
-        return jsonify({"error": "Token rejected by Discord /users/@me — it is invalid or expired."}), 401
+    proxy_list = _normalize_proxies(data.get("proxies"))
+    use_proxy = bool(proxy_list) and data.get("use_proxy", True)
 
-    letters = string.ascii_lowercase
-    combinations = ["".join(p) for p in itertools.product(letters, repeat=length)]
+    # Generate usernames: letters + digits (e.g. "a0", "x9", "ab", "12")
+    chars = string.ascii_lowercase + string.digits
+    combinations = ["".join(p) for p in itertools.product(chars, repeat=length)]
     random.shuffle(combinations)
 
     total = len(combinations)
@@ -1327,78 +1285,64 @@ def check_usernames():
     fatal_lock = threading.Lock()
     warning_sent = [False]
 
+    BROWSER_RECYCLE_EVERY = 20  # restart browser + rotate IP every N checks per worker
+
     def worker(combo_batch, worker_id):
+        checks_since_recycle = 0
         for position, combo in enumerate(combo_batch):
             if stop_event.is_set():
                 return
 
-            # A route can be rate-limited or blocked even when the token is valid.
-            # Retry the same name a few times, rotating to the next supplied proxy
-            # on every attempt, then skip it and continue instead of killing the run.
-            res = None
-            for attempt in range(3):
-                if stop_event.is_set():
-                    return
-                proxy_url = None
-                if use_proxy and proxy_list:
-                    proxy_url = proxy_list[(worker_id + position + attempt) % len(proxy_list)]
-                pace_requests(min_interval=0.65)
-                res = check_discord_username(combo, auth_token, proxy_url, use_proxy)
-                if not res.get("retryable") or res.get("available") is not None:
-                    break
-                if attempt < 2:
-                    time.sleep(1.0 + attempt * 1.5)
+            # Every 20 checks: pause briefly so the new browser context gets a clean slate,
+            # then rotate to the next proxy (or stay direct) for a fresh IP appearance.
+            if checks_since_recycle >= BROWSER_RECYCLE_EVERY:
+                checks_since_recycle = 0
+                time.sleep(random.uniform(3, 6))  # cooldown between browser sessions
 
-            if res is None:
-                res = {"available": None, "status": None, "discord_msg": "No response", "fatal": False, "retryable": True}
+            proxy_url = None
+            if use_proxy and proxy_list:
+                idx = (worker_id + position) % len(proxy_list)
+                # Also rotate on recycle for a fresh IP
+                if checks_since_recycle == 0 and position > 0:
+                    idx = (worker_id + position + 1) % len(proxy_list)
+                proxy_url = proxy_list[idx]
 
-            # A fatal token error is not a username result. Keep it out of the
-            # counters; the UI will show the separate fatal event instead.
-            if res.get("fatal"):
-                # Only a separately confirmed invalid token is fatal. Guard this so
-                # five workers cannot emit five different fatal events at once.
-                with fatal_lock:
-                    if fatal_error[0] is None:
-                        fatal_error[0] = res.get("discord_msg") or "Discord rejected the token"
-                        result_queue.put({
-                            "type": "fatal",
-                            "message": fatal_error[0],
-                            "status": res.get("status"),
-                        })
-                        stop_event.set()
-                return
+            # Each check opens a fresh browser (via _check_username_via_register).
+            # Playwright creates a new context per call, so cookies/cache are inherently fresh.
+            result = _check_username_via_register(combo, proxy_url, cam_id=str(worker_id))
+            checks_since_recycle += 1
 
-            # Every non-fatal username attempt gets exactly one classification.
-            # `available=False` is definitive Invalid; retryable/unknown stays
-            # visible as Retrying instead of being falsely called Invalid.
+            avail = result.get("available")
+            detail = result.get("detail", "")
+
             with stats_lock:
                 checked_count[0] += 1
                 check_stats["checked"] += 1
-                if res.get("available") is True:
+                if avail is True:
                     check_stats["available"] += 1
-                elif res.get("available") is False:
+                elif avail is False:
                     check_stats["invalid"] += 1
                 else:
                     check_stats["retrying"] += 1
 
-            # Push a progress event for every completed classification, including
-            # definitive Invalid results that do not emit a `found` event.
             result_queue.put({"type": "progress"})
 
-            if res.get("available") is True:
+            if avail is True:
                 with stats_lock:
                     available_list.append(combo)
                 result_queue.put({"type": "found", "username": combo})
-            elif res.get("retryable"):
-                # The result is already counted above; this message is only the
-                # first explanatory warning for the operator.
+            elif avail is None:
+                # Browser-level error — warn once, keep going
                 with fatal_lock:
                     if not warning_sent[0]:
                         warning_sent[0] = True
                         result_queue.put({
                             "type": "warning",
-                            "message": "Discord is limiting or blocking username checks from the current route; continuing with retries/proxies. Some names may remain unchecked.",
+                            "message": f"Browser errors detected (e.g. {detail[:80]}). Continuing with next names. Check proxies if errors persist.",
                         })
+
+            # Small jitter between checks to avoid pattern detection
+            time.sleep(random.uniform(0.8, 2.2))
 
         result_queue.put({"type": "done"})
 
