@@ -651,6 +651,69 @@ def _browser_proxy(proxy_url):
     return server, username, password
 
 
+# guns.lol shows a "Click to enter" gate over profile pages. A real visitor waits,
+# then clicks it (or the center of the page) — only then is the visit treated as a
+# genuine profile view. The bot now mimics exactly that.
+GATE_TEXT_MARKERS = (
+    "click to enter", "click here to enter", "click to continue",
+    "click to view", "click to open", "click to enter the profile",
+    "enter the profile", "show profile", "click to unlock",
+)
+
+
+def _find_gate_element(page):
+    """Find the 'Click to enter' gate element if it's mounted and visible."""
+    for m in GATE_TEXT_MARKERS:
+        try:
+            els = page.query_selector_all(f"text={m}")
+            for e in els:
+                try:
+                    if e.is_visible():
+                        return e
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return None
+
+
+def _click_through_gate(page, width, height):
+    """Click guns.lol's 'Click to enter' overlay like a human: ~3s after load,
+    then click (gate element, else page center) 5 times, 4s apart.
+    Returns (clicks_done, gate_found)."""
+    try:
+        page.wait_for_timeout(3000)
+    except Exception:
+        pass
+    clicks = 0
+    gate_found = False
+    for i in range(5):
+        try:
+            el = _find_gate_element(page)
+            if el is not None:
+                gate_found = True
+                box = el.bounding_box()
+                if box and box.get("width") and box.get("height"):
+                    page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                else:
+                    page.mouse.click(width // 2, height // 2)
+            else:
+                page.mouse.click(width // 2, height // 2)
+            clicks += 1
+        except Exception:
+            try:
+                page.mouse.click(width // 2, height // 2)
+                clicks += 1
+            except Exception:
+                pass
+        if i < 4:
+            try:
+                page.wait_for_timeout(4000)
+            except Exception:
+                pass
+    return clicks, gate_found
+
+
 def _send_playwright_view(target_url, proxy_url):
     from playwright.sync_api import sync_playwright
     ua = random.choice(USER_AGENTS)
@@ -732,9 +795,30 @@ def _send_playwright_view(target_url, proxy_url):
                         beacon_tag = " · beacon ✓ view registered" if beacons else " · ⚠ no analytics beacon"
                         return True, f"Challenge cleared · {time.time()-t0:.1f}s · real browser{beacon_tag}"
                 return False, "Blocked by challenge/Cloudflare"
+            gate_note = ""
+            if "guns.lol" in (target_url or "").lower():
+                # Honesty first: guns.lol serves bots a fake 'Username not found'
+                # page. The analytics beacon still fires on it — so those were being
+                # counted as views without any profile ever loading (the 'larp').
+                try:
+                    body_low = (page.content() or "").lower()
+                except Exception:
+                    body_low = ""
+                if "username not found" in body_low or "claim this username" in body_low:
+                    return False, "Not counted — guns.lol served 'Username not found' (bot-detected 404 or wrong handle)"
+                # Real profile → click the 'Click to enter' gate like a human.
+                before = len(beacons)
+                clicks, gate_found = _click_through_gate(page, viewport[0], viewport[1])
+                gained = len(beacons) - before
+                if gate_found:
+                    gate_note = f" · gate ✓ clicked {clicks}x"
+                elif clicks > 0:
+                    gate_note = f" · center clicked {clicks}x (no gate found)"
+                if gained > 0:
+                    gate_note += f" · +{gained} beacon(s) after click"
             context.close()
             beacon_tag = " · beacon ✓ view registered" if beacons else " · ⚠ no analytics beacon"
-            return True, f"HTTP {status or 200} · {time.time()-t0:.1f}s · real browser{beacon_tag}"
+            return True, f"HTTP {status or 200} · {time.time()-t0:.1f}s · real browser{beacon_tag}{gate_note}"
         finally:
             try:
                 browser.close()
@@ -745,6 +829,7 @@ def _send_playwright_view(target_url, proxy_url):
 def _send_chrome_view(target_url, proxy_url):
     import undetected_chromedriver as uc
     from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
     opts = Options()
     if proxy_url:
         server, _, _ = _browser_proxy(proxy_url)
@@ -774,7 +859,27 @@ def _send_chrome_view(target_url, proxy_url):
         title = (driver.title or "").lower()
         if any(m in title for m in CHALLENGE_MARKERS):
             return False, "Blocked by challenge/Cloudflare"
-        return True, f"Loaded in {time.time()-t0:.1f}s · real browser"
+        gate_note = ""
+        if "guns.lol" in (target_url or "").lower():
+            try:
+                body = (driver.page_source or "").lower()
+                if "username not found" in body or "claim this username" in body:
+                    return False, "Not counted — guns.lol served 'Username not found' (bot-detected 404 or wrong handle)"
+            except Exception:
+                pass
+            time.sleep(3)
+            for _ in range(5):
+                try:
+                    els = driver.find_elements(By.XPATH, "//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'click to enter')]")
+                    if els:
+                        els[-1].click()
+                    else:
+                        driver.execute_script("document.elementFromPoint(960, 540).click();")
+                except Exception:
+                    pass
+                time.sleep(4)
+            gate_note = " · gate clicked"
+        return True, f"Loaded in {time.time()-t0:.1f}s · real browser{gate_note}"
     finally:
         try:
             driver.quit()
