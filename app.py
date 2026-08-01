@@ -48,6 +48,11 @@ BOT_STATE = {
     "workers": {},             # id -> {status, views, errors, last, last_at}
 }
 
+# ── Live cams (per-worker latest frame, thread-safe) ───────────────────
+CAM_LOCK = threading.Lock()
+CAM_BUFFER = {}  # worker_id -> {"data": bytes, "mime": str, "ts": float, "label": str}
+
+
 # ── Global request pacing (Discord checker) ────────────────────────────
 PACE_LOCK = threading.Lock()
 PACE_LAST = [0.0]
@@ -677,14 +682,46 @@ def _find_gate_element(page):
     return None
 
 
-def _click_through_gate(page, width, height):
-    """Click guns.lol's 'Click to enter' overlay like a human: ~3s after load,
-    then click (gate element, else page center) 5 times, 4s apart.
-    Returns (clicks_done, gate_found)."""
+def _snap_cam(cam_id, page, label):
+    """Capture the current page state into the live-cam buffer for this worker (Playwright)."""
+    if cam_id is None:
+        return
     try:
-        page.wait_for_timeout(3000)
+        data = page.screenshot(type="jpeg", quality=60)
+        with CAM_LOCK:
+            CAM_BUFFER[str(cam_id)] = {"data": data, "mime": "image/jpeg", "ts": time.time(), "label": label}
     except Exception:
         pass
+
+
+def _snap_cam_chrome(cam_id, driver, label):
+    """Capture the current page state into the live-cam buffer (Selenium/Chrome)."""
+    if cam_id is None:
+        return
+    try:
+        data = driver.get_screenshot_as_png()
+        with CAM_LOCK:
+            CAM_BUFFER[str(cam_id)] = {"data": data, "mime": "image/png", "ts": time.time(), "label": label}
+    except Exception:
+        pass
+
+
+def _click_through_gate(page, width, height, on_frame=None):
+    """Click guns.lol's 'Click to enter' overlay like a human: ~3s after load,
+    then click (gate element, else page center) 5 times, 4s apart.
+    Calls on_frame(label) between clicks so the live cam shows a frame every ~2s.
+    Returns (clicks_done, gate_found)."""
+    # 3s pre-click wait, fed to the cam at 1.5s intervals.
+    for _ in range(2):
+        try:
+            page.wait_for_timeout(1500)
+        except Exception:
+            pass
+        if on_frame:
+            try:
+                on_frame("gate: waiting")
+            except Exception:
+                pass
     clicks = 0
     gate_found = False
     for i in range(5):
@@ -706,15 +743,27 @@ def _click_through_gate(page, width, height):
                 clicks += 1
             except Exception:
                 pass
-        if i < 4:
+        if on_frame:
             try:
-                page.wait_for_timeout(4000)
+                on_frame(f"gate click {i+1}/5")
             except Exception:
                 pass
+        if i < 4:
+            # Split the 4s gap in half so the cam gets a frame every 2s.
+            for _ in range(2):
+                try:
+                    page.wait_for_timeout(2000)
+                except Exception:
+                    pass
+                if on_frame:
+                    try:
+                        on_frame(f"gate clicked {i+1}/5")
+                    except Exception:
+                        pass
     return clicks, gate_found
 
 
-def _send_playwright_view(target_url, proxy_url):
+def _send_playwright_view(target_url, proxy_url, cam_id=None):
     from playwright.sync_api import sync_playwright
     ua = random.choice(USER_AGENTS)
     viewport = random.choice([(1366, 768), (1440, 900), (1536, 864), (1920, 1080), (1280, 720)])
@@ -747,6 +796,12 @@ def _send_playwright_view(target_url, proxy_url):
                 extra_http_headers={"Accept-Language": "en-US,en;q=0.9", "Referer": "https://www.google.com/"},
             )
             page = context.new_page()
+            cam_id_str = str(cam_id) if cam_id is not None else None
+
+            def on_frame(label):
+                if cam_id_str is not None:
+                    _snap_cam(cam_id_str, page, label)
+
             # guns.lol counts a view when its analytics beacon fires on page load
             # (sa.guns.lol/simple.gif?...type=pageview). Detecting it is hard proof the view registered.
             beacons = []
@@ -762,11 +817,18 @@ def _send_playwright_view(target_url, proxy_url):
             page.on("response", _track_beacon)
             t0 = time.time()
             resp = page.goto(target_url, timeout=30000, wait_until="domcontentloaded")
-            # human-ish behavior: scroll, dwell
-            page.wait_for_timeout(random.randint(2500, 6000))
+            on_frame("loaded")
+            # human-ish behavior: scroll, dwell (cam frame every ~2s)
+            dwell = random.randint(2500, 6000)
+            while dwell > 0:
+                step = min(2000, dwell)
+                page.wait_for_timeout(step)
+                dwell -= step
+                on_frame("viewing")
             for _ in range(random.randint(1, 3)):
                 page.mouse.wheel(0, random.randint(200, 800))
                 page.wait_for_timeout(random.randint(400, 1200))
+                on_frame("scrolling")
             title = (page.title() or "").lower()
             status = resp.status if resp else None
             if status and status >= 400:
@@ -776,11 +838,15 @@ def _send_playwright_view(target_url, proxy_url):
                 except Exception:
                     body = ""
                 if "403" in str(status) and any(m in body for m in ("cloudflare", "cf-", "access denied", "error 1009", "temporary block", "forbidden", "just a moment", "please wait a moment")):
+                    on_frame("blocked 403")
                     return False, "Blocked (HTTP 403 — challenge/IP flagged)"
                 if status == 401:
                     if any(m in body for m in ("captcha", "verify", "human", "suspended", "rate limit", "too many")):
+                        on_frame("gated 401")
                         return False, "HTTP 401 — IP gated (captcha/rate-limit)"
+                    on_frame("gated 401")
                     return False, "HTTP 401 — IP gated (rate-limited)"
+                on_frame(f"http {status}")
                 return False, f"HTTP {status} from server"
             # Cloudflare interstitial ("Just a moment…") — wait for it to auto-clear before failing.
             if any(m in title for m in CHALLENGE_MARKERS):
@@ -792,8 +858,10 @@ def _send_playwright_view(target_url, proxy_url):
                     except Exception:
                         new_title = ""
                     if not any(m in new_title for m in CHALLENGE_MARKERS):
+                        on_frame("challenge cleared")
                         beacon_tag = " · beacon ✓ view registered" if beacons else " · ⚠ no analytics beacon"
                         return True, f"Challenge cleared · {time.time()-t0:.1f}s · real browser{beacon_tag}"
+                on_frame("challenge stuck")
                 return False, "Blocked by challenge/Cloudflare"
             gate_note = ""
             if "guns.lol" in (target_url or "").lower():
@@ -805,10 +873,11 @@ def _send_playwright_view(target_url, proxy_url):
                 except Exception:
                     body_low = ""
                 if "username not found" in body_low or "claim this username" in body_low:
+                    on_frame("username not found")
                     return False, "Not counted — guns.lol served 'Username not found' (bot-detected 404 or wrong handle)"
                 # Real profile → click the 'Click to enter' gate like a human.
                 before = len(beacons)
-                clicks, gate_found = _click_through_gate(page, viewport[0], viewport[1])
+                clicks, gate_found = _click_through_gate(page, viewport[0], viewport[1], on_frame=on_frame)
                 gained = len(beacons) - before
                 if gate_found:
                     gate_note = f" · gate ✓ clicked {clicks}x"
@@ -816,6 +885,7 @@ def _send_playwright_view(target_url, proxy_url):
                     gate_note = f" · center clicked {clicks}x (no gate found)"
                 if gained > 0:
                     gate_note += f" · +{gained} beacon(s) after click"
+            on_frame("done")
             context.close()
             beacon_tag = " · beacon ✓ view registered" if beacons else " · ⚠ no analytics beacon"
             return True, f"HTTP {status or 200} · {time.time()-t0:.1f}s · real browser{beacon_tag}{gate_note}"
@@ -826,7 +896,7 @@ def _send_playwright_view(target_url, proxy_url):
                 pass
 
 
-def _send_chrome_view(target_url, proxy_url):
+def _send_chrome_view(target_url, proxy_url, cam_id=None):
     import undetected_chromedriver as uc
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.common.by import By
@@ -855,20 +925,23 @@ def _send_chrome_view(target_url, proxy_url):
         driver.set_page_load_timeout(30)
         t0 = time.time()
         driver.get(target_url)
+        _snap_cam_chrome(cam_id, driver, "loaded")
         time.sleep(random.uniform(2.5, 6))
         title = (driver.title or "").lower()
         if any(m in title for m in CHALLENGE_MARKERS):
+            _snap_cam_chrome(cam_id, driver, "challenge stuck")
             return False, "Blocked by challenge/Cloudflare"
         gate_note = ""
         if "guns.lol" in (target_url or "").lower():
             try:
                 body = (driver.page_source or "").lower()
                 if "username not found" in body or "claim this username" in body:
+                    _snap_cam_chrome(cam_id, driver, "username not found")
                     return False, "Not counted — guns.lol served 'Username not found' (bot-detected 404 or wrong handle)"
             except Exception:
                 pass
             time.sleep(3)
-            for _ in range(5):
+            for i in range(5):
                 try:
                     els = driver.find_elements(By.XPATH, "//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'click to enter')]")
                     if els:
@@ -877,8 +950,12 @@ def _send_chrome_view(target_url, proxy_url):
                         driver.execute_script("document.elementFromPoint(960, 540).click();")
                 except Exception:
                     pass
-                time.sleep(4)
+                _snap_cam_chrome(cam_id, driver, f"gate click {i+1}/5")
+                time.sleep(2)
+                _snap_cam_chrome(cam_id, driver, f"gate clicked {i+1}/5")
+                time.sleep(2)
             gate_note = " · gate clicked"
+        _snap_cam_chrome(cam_id, driver, "done")
         return True, f"Loaded in {time.time()-t0:.1f}s · real browser{gate_note}"
     finally:
         try:
@@ -986,9 +1063,9 @@ def guns_worker(target_url, proxies, worker_id, stop_event):
                 return
             try:
                 if engine == "playwright":
-                    ok, detail = _send_playwright_view(target_url, proxy)
+                    ok, detail = _send_playwright_view(target_url, proxy, cam_id=worker_id)
                 elif engine == "chrome":
-                    ok, detail = _send_chrome_view(target_url, proxy)
+                    ok, detail = _send_chrome_view(target_url, proxy, cam_id=worker_id)
                 else:
                     ok, detail = _send_requests_view(target_url, proxy)
                 break  # got a definitive answer
@@ -1289,7 +1366,23 @@ def bot_status():
         state = dict(BOT_STATE)
         state["logs"] = list(BOT_LOGS)[-80:]
         state["browser_install"] = BROWSER_INSTALL_STATE[0]
-        return jsonify(state)
+    with CAM_LOCK:
+        state["cams"] = {k: {"ts": v.get("ts", 0), "label": v.get("label", "")} for k, v in CAM_BUFFER.items()}
+    return jsonify(state)
+
+
+@app.route("/cam/<int:worker_id>")
+def cam_frame(worker_id):
+    """Latest live frame for a worker (JPEG/PNG). 404 until the first frame exists."""
+    with CAM_LOCK:
+        f = CAM_BUFFER.get(str(worker_id))
+    if not f:
+        return "", 404
+    resp = Response(f["data"], mimetype=f.get("mime", "image/jpeg"))
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Cam-Label"] = f.get("label", "")
+    resp.headers["X-Cam-Ts"] = str(int(f.get("ts", 0)))
+    return resp
 
 
 @app.route("/view_count")

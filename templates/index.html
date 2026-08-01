@@ -347,7 +347,67 @@
         .stat.red .num { color: var(--red); }
         .stat.blue .num { color: #7b83f6; }
 
-        .worker-list { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+        .worker-list { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+        .worker-item {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            background: var(--surface2);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 8px;
+        }
+        .worker-cam {
+            position: relative;
+            width: 100%;
+            height: 150px;
+            background: #000;
+            border-radius: 7px;
+            overflow: hidden;
+            border: 1px solid var(--border);
+        }
+        .worker-cam img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: block;
+            image-rendering: auto;
+        }
+        .worker-cam .cam-empty {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: var(--muted);
+            font-size: 0.78em;
+        }
+        .cam-badge {
+            position: absolute;
+            top: 6px;
+            right: 6px;
+            font-size: 0.6em;
+            font-weight: 800;
+            letter-spacing: 0.06em;
+            padding: 3px 8px;
+            border-radius: 99px;
+            text-transform: uppercase;
+        }
+        .cam-badge.live { background: var(--green); color: #06240f; }
+        .cam-badge.idle { background: #3a3d46; color: var(--muted); }
+        .cam-label {
+            position: absolute;
+            left: 6px;
+            bottom: 6px;
+            font-size: 0.62em;
+            color: #fff;
+            background: rgba(0,0,0,0.65);
+            padding: 2px 8px;
+            border-radius: 4px;
+            max-width: 70%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
         .worker-row {
             display: grid;
             grid-template-columns: 70px 1fr auto auto auto auto;
@@ -557,25 +617,39 @@
                 document.getElementById('btnStartGuns').disabled = s.running;
                 document.getElementById('btnStopGuns').disabled = !s.running;
 
-                renderWorkers(s.workers);
+                renderWorkers(s.workers, s.cams || {});
                 appendLogs(s.logs || []);
             } catch (e) {}
         }
 
-        function renderWorkers(workers) {
+        function renderWorkers(workers, cams) {
             const list = document.getElementById('workerList');
             if (!workers || Object.keys(workers).length === 0) { list.innerHTML = ''; return; }
             const keys = Object.keys(workers).sort((a, b) => parseInt(a) - parseInt(b));
+            const now = Math.floor(Date.now() / 1000);
             list.innerHTML = keys.map(id => {
                 const w = workers[id];
                 const ip = w.exit_ip ? `<span class="wcircuit">${w.exit_ip}</span>` : '';
-                return `<div class="worker-row">
-                    <span class="wid">W${parseInt(id) + 1}</span>
-                    <span class="wlast" title="${escapeHtml(w.last || '')}">${w.last || '—'}</span>
-                    <span class="wviews">${w.views} views</span>
-                    <span class="werrors">${w.errors} err</span>
-                    <span class="wcircuit">&#x1F504;${w.circuit || 0}</span>
-                    <span class="wstatus ${w.status}">${w.status}</span>
+                const cam = (cams && cams[id]) || null;
+                const fresh = cam && (now - cam.ts) < 8;
+                const camHtml = cam
+                    ? `<div class="worker-cam">
+                        <img src="/cam/${id}?t=${now}" alt="live cam" onerror="this.style.display='none';this.parentElement.querySelector('.cam-empty').style.display='flex';">
+                        <div class="cam-empty" style="display:none">&#x1F4F7; waiting for frame…</div>
+                        <span class="cam-badge ${fresh ? 'live' : 'idle'}">${fresh ? '&#x25CF; LIVE' : '&#x25CB; IDLE'}</span>
+                        <span class="cam-label">${escapeHtml(cam.label || '')}</span>
+                      </div>`
+                    : `<div class="worker-cam"><div class="cam-empty">&#x1F4F7; no camera yet</div></div>`;
+                return `<div class="worker-item">
+                    <div class="worker-row">
+                        <span class="wid">W${parseInt(id) + 1}</span>
+                        <span class="wlast" title="${escapeHtml(w.last || '')}">${w.last || '—'}</span>
+                        <span class="wviews">${w.views} views</span>
+                        <span class="werrors">${w.errors} err</span>
+                        <span class="wcircuit">&#x1F504;${w.circuit || 0}</span>
+                        <span class="wstatus ${w.status}">${w.status}</span>
+                    </div>
+                    ${camHtml}
                 </div>`;
             }).join('');
         }
