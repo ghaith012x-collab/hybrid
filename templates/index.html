@@ -313,6 +313,31 @@
             font-weight: 600;
             animation: popIn 0.3s ease;
         }
+        .invalid-badge {
+            background: rgba(237,66,69,0.10);
+            color: var(--red);
+            border: 1px solid rgba(237,66,69,0.28);
+            padding: 5px 12px;
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 0.85em;
+            font-weight: 600;
+            animation: popIn 0.3s ease;
+        }
+        .badge-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 12px;
+            flex-wrap: wrap;
+        }
+        .badge-group .group-label {
+            font-size: 0.7em;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            color: var(--muted);
+        }
         @keyframes popIn { from { transform: scale(0.8); opacity: 0; } to { transform: scale(1); opacity: 1; } }
 
         .toast {
@@ -526,7 +551,15 @@
                 </div>
             </div>
 
-            <div class="found-badges" id="foundBadges"></div>
+            <div class="badge-group">
+                <span class="group-label">&#x2705; Available</span>
+                <div class="found-badges" id="foundBadges" style="margin:0"></div>
+            </div>
+            <div class="badge-group">
+                <span class="group-label">&#x274C; Invalid/Taken (<span id="invalidCountLive">0</span>)</span>
+                <div class="found-badges" id="invalidBadges" style="margin:0"></div>
+            </div>
+            <div class="worker-list" id="checkerCams" style="margin-top:14px"></div>
             <div class="status-box" id="discordLog"></div>
         </div>
 
@@ -584,6 +617,7 @@
         let checking = false;
 
         let foundUsernames = [];
+        let invalidUsernames = [];
         let viewInterval = null;
         let botInterval = null;
         let lastLogId = 0;
@@ -718,6 +752,7 @@
             if (checking) return;
             checking = true;
             foundUsernames = [];
+            invalidUsernames = [];
             abortController = new AbortController();
 
             const log = document.getElementById('discordLog');
@@ -729,10 +764,16 @@
             const availableCountEl = document.getElementById('availableCount');
             const retryingCountEl = document.getElementById('retryingCount');
             const badges = document.getElementById('foundBadges');
+            const invalidBadges = document.getElementById('invalidBadges');
+            const invalidCountLive = document.getElementById('invalidCountLive');
+            const checkerCamsEl = document.getElementById('checkerCams');
             const btnStop = document.getElementById('btnStop');
 
             log.innerHTML = '';
             badges.innerHTML = '';
+            document.getElementById('invalidBadges').innerHTML = '';
+            document.getElementById('invalidCountLive').textContent = '0';
+            document.getElementById('checkerCams').innerHTML = '';
             progressBar.style.width = '0%';
             foundCountEl.textContent = 'Available: 0';
             checkedCountEl.textContent = '0';
@@ -779,7 +820,7 @@
                         if (!line.startsWith('data: ')) continue;
                         try {
                             const event = JSON.parse(line.slice(6));
-                            handleEvent(event, log, progressBar, progressText, foundCountEl, checkedCountEl, invalidCountEl, availableCountEl, retryingCountEl, badges);
+                            handleEvent(event, log, progressBar, progressText, foundCountEl, checkedCountEl, invalidCountEl, availableCountEl, retryingCountEl, badges, invalidBadges, invalidCountLive, checkerCamsEl);
                         } catch (e) {}
                     }
                 }
@@ -795,7 +836,7 @@
             }
         }
 
-        function handleEvent(event, log, bar, ptext, fcount, checkedEl, invalidEl, availableEl, retryingEl, badges) {
+        function handleEvent(event, log, bar, ptext, fcount, checkedEl, invalidEl, availableEl, retryingEl, badges, invalidBadges, invalidCountLive, checkerCamsEl) {
             const checked = Number(event.checked || 0);
             const invalid = Number(event.invalid || 0);
             const available = Number(event.available || 0);
@@ -820,6 +861,17 @@
                     badges.appendChild(b);
                     break;
 
+                case 'invalid':
+                    invalidUsernames.push(event.username);
+                    if (invalidCountLive) invalidCountLive.textContent = invalidUsernames.length.toLocaleString();
+                    logEntry(log, `&#x274C; ${event.username} — TAKEN/INVALID`, 'error');
+                    const ib = document.createElement('span');
+                    ib.className = 'invalid-badge';
+                    ib.textContent = event.username;
+                    invalidBadges.appendChild(ib);
+                    if (invalidBadges.children.length > 400) invalidBadges.removeChild(invalidBadges.firstChild);
+                    break;
+
                 case 'progress':
                     break;
 
@@ -837,13 +889,43 @@
                 case 'complete':
                     bar.style.width = '100%';
                     const availableNames = event.available_names || [];
+                    const invalidNames = event.invalid_names || [];
+                    if (invalidCountLive) invalidCountLive.textContent = invalidNames.length.toLocaleString();
                     if (availableNames.length === 0) {
-                        logEntry(log, `Done — no available usernames found in ${checked.toLocaleString()} classified checks.`, 'progress');
+                        logEntry(log, `Done — no available usernames found in ${checked.toLocaleString()} classified checks. ${invalidNames.length.toLocaleString()} invalid/taken.`, 'progress');
                     } else {
-                        logEntry(log, `Done! Found ${availableNames.length} available in ${checked.toLocaleString()} classified checks.`, 'progress');
+                        logEntry(log, `Done! Found ${availableNames.length} available, ${invalidNames.length.toLocaleString()} invalid/taken in ${checked.toLocaleString()} classified checks.`, 'progress');
                     }
                     break;
             }
+
+            // Live cams for the 5 checker workers
+            if (event.cams && checkerCamsEl) renderCheckerCams(event.cams, checkerCamsEl);
+        }
+
+        function renderCheckerCams(cams, container) {
+            const now = Math.floor(Date.now() / 1000);
+            const keys = Object.keys(cams).sort((a, b) => parseInt(a.slice(3)) - parseInt(b.slice(3)));
+            container.innerHTML = keys.map(k => {
+                const cam = cams[k];
+                const fresh = cam && (now - cam.ts) < 8;
+                const wid = k.slice(3);
+                const camHtml = `<div class="worker-cam">
+                        <img src="/checker_cam/${wid}?t=${now}" alt="live cam" onerror="this.style.display='none';this.parentElement.querySelector('.cam-empty').style.display='flex';">
+                        <div class="cam-empty" style="display:none">&#x1F4F7; waiting for frame…</div>
+                        <span class="cam-badge ${fresh ? 'live' : 'idle'}">${fresh ? '&#x25CF; LIVE' : '&#x25CB; IDLE'}</span>
+                        <span class="cam-label">${escapeHtml(cam.label || '')}</span>
+                      </div>`;
+                return `<div class="worker-item">
+                    <div class="worker-row">
+                        <span class="wid">W${parseInt(wid) + 1}</span>
+                        <span class="wlast">${escapeHtml(cam.label || 'starting…')}</span>
+                        <span class="wviews">checking</span>
+                        <span class="wstatus ok">live</span>
+                    </div>
+                    ${camHtml}
+                </div>`;
+            }).join('');
         }
 
         function stopCheck() {

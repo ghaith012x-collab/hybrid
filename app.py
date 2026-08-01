@@ -374,6 +374,7 @@ def _check_username_via_register(username, proxy_url=None, cam_id=None):
                 page = context.new_page()
                 resp = page.goto("https://discord.com/register", timeout=30000, wait_until="domcontentloaded")
                 page.wait_for_timeout(2000)
+                _snap_cam(cam_id, page, "register page open")
 
                 input_el = None
                 for sel in DISCORD_USERNAME_SELECTORS:
@@ -408,11 +409,13 @@ def _check_username_via_register(username, proxy_url=None, cam_id=None):
                     input_el.fill("")
                     page.wait_for_timeout(200)
                     input_el.type(username, delay=random.randint(40, 100))
+                    _snap_cam(cam_id, page, f"typing {username}")
                 except Exception:
                     context.close()
                     return {"available": None, "detail": "Could not type username into register form"}
 
                 page.wait_for_timeout(random.randint(1800, 3000))
+                _snap_cam(cam_id, page, f"checking {username}")
 
                 try:
                     body_text = (page.content() or "").lower()
@@ -421,12 +424,14 @@ def _check_username_via_register(username, proxy_url=None, cam_id=None):
 
                 for marker in DISCORD_UNAVAILABLE_MARKERS:
                     if marker in body_text:
+                        _snap_cam(cam_id, page, f"{username}: taken")
                         context.close()
                         elapsed = time.time() - t0
                         return {"available": False, "detail": f"Taken ({marker}) · {elapsed:.1f}s"}
 
                 for marker in DISCORD_AVAILABLE_MARKERS:
                     if marker in body_text:
+                        _snap_cam(cam_id, page, f"{username}: available")
                         context.close()
                         elapsed = time.time() - t0
                         return {"available": True, "detail": f"Available · {elapsed:.1f}s"}
@@ -434,6 +439,7 @@ def _check_username_via_register(username, proxy_url=None, cam_id=None):
                 try:
                     aria_invalid = input_el.get_attribute("aria-invalid")
                     if aria_invalid == "true":
+                        _snap_cam(cam_id, page, f"{username}: taken")
                         context.close()
                         elapsed = time.time() - t0
                         return {"available": False, "detail": f"Taken (aria-invalid=true) · {elapsed:.1f}s"}
@@ -446,6 +452,7 @@ def _check_username_via_register(username, proxy_url=None, cam_id=None):
                         try:
                             txt = (e.text_content() or "").lower()
                             if any(m in txt for m in DISCORD_UNAVAILABLE_MARKERS):
+                                _snap_cam(cam_id, page, f"{username}: taken")
                                 context.close()
                                 elapsed = time.time() - t0
                                 return {"available": False, "detail": f"Taken (error element) · {elapsed:.1f}s"}
@@ -454,6 +461,7 @@ def _check_username_via_register(username, proxy_url=None, cam_id=None):
                 except Exception:
                     pass
 
+                _snap_cam(cam_id, page, f"{username}: likely taken")
                 context.close()
                 elapsed = time.time() - t0
                 return {"available": False, "detail": f"Likely taken (no availability indicator) · {elapsed:.1f}s"}
@@ -1272,6 +1280,7 @@ def check_usernames():
     stop_event = threading.Event()
     checked_count = [0]
     available_list = []
+    invalid_list = []
     # Live, mutually exclusive username-result counters. A retryable result is
     # visible as "Retrying" so the UI never presents a blocked route as invalid.
     check_stats = {
@@ -1309,7 +1318,7 @@ def check_usernames():
 
             # Each check opens a fresh browser (via _check_username_via_register).
             # Playwright creates a new context per call, so cookies/cache are inherently fresh.
-            result = _check_username_via_register(combo, proxy_url, cam_id=str(worker_id))
+            result = _check_username_via_register(combo, proxy_url, cam_id=f"chk{worker_id}")
             checks_since_recycle += 1
 
             avail = result.get("available")
@@ -1331,6 +1340,10 @@ def check_usernames():
                 with stats_lock:
                     available_list.append(combo)
                 result_queue.put({"type": "found", "username": combo})
+            elif avail is False:
+                with stats_lock:
+                    invalid_list.append(combo)
+                result_queue.put({"type": "invalid", "username": combo})
             elif avail is None:
                 # Browser-level error — warn once, keep going
                 with fatal_lock:
@@ -1366,9 +1379,14 @@ def check_usernames():
                 with stats_lock:
                     snapshot = dict(check_stats)
                 snapshot["total"] = total
+                with CAM_LOCK:
+                    snapshot["cams"] = {k: {"ts": v.get("ts", 0), "label": v.get("label", "")} for k, v in CAM_BUFFER.items() if k.startswith("chk")}
 
                 if msg["type"] == "found":
                     snapshot.update({"event": "found", "username": msg["username"]})
+                    yield f"data: {json.dumps(snapshot)}\n\n"
+                elif msg["type"] == "invalid":
+                    snapshot.update({"event": "invalid", "username": msg["username"]})
                     yield f"data: {json.dumps(snapshot)}\n\n"
                 elif msg["type"] == "fatal":
                     snapshot.update({"event": "fatal", "message": msg["message"], "status": msg.get("status")})
@@ -1391,7 +1409,7 @@ def check_usernames():
         if fatal_error[0] is None:
             with stats_lock:
                 snapshot = dict(check_stats)
-            snapshot.update({"event": "complete", "available_names": list(available_list), "total": total})
+            snapshot.update({"event": "complete", "available_names": list(available_list), "invalid_names": list(invalid_list), "total": total})
             yield f"data: {json.dumps(snapshot)}\n\n"
 
     return Response(
@@ -1515,6 +1533,20 @@ def cam_frame(worker_id):
     """Latest live frame for a worker (JPEG/PNG). 404 until the first frame exists."""
     with CAM_LOCK:
         f = CAM_BUFFER.get(str(worker_id))
+    if not f:
+        return "", 404
+    resp = Response(f["data"], mimetype=f.get("mime", "image/jpeg"))
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Cam-Label"] = f.get("label", "")
+    resp.headers["X-Cam-Ts"] = str(int(f.get("ts", 0)))
+    return resp
+
+
+@app.route("/checker_cam/<int:worker_id>")
+def checker_cam_frame(worker_id):
+    """Latest live frame for a username-checker worker (JPEG/PNG)."""
+    with CAM_LOCK:
+        f = CAM_BUFFER.get(f"chk{worker_id}")
     if not f:
         return "", 404
     resp = Response(f["data"], mimetype=f.get("mime", "image/jpeg"))
