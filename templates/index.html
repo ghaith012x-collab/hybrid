@@ -249,6 +249,41 @@
             font-size: 0.75em;
             color: var(--muted);
         }
+        .checker-stats {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 7px;
+            margin-top: 10px;
+        }
+        .checker-stat {
+            min-width: 0;
+            padding: 8px 6px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: rgba(255,255,255,0.025);
+            text-align: center;
+        }
+        .checker-stat .value {
+            display: block;
+            font-family: monospace;
+            font-size: 1.05em;
+            font-weight: 800;
+        }
+        .checker-stat .label {
+            display: block;
+            margin-top: 2px;
+            color: var(--muted);
+            font-size: 0.62em;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+        .checker-stat.checked .value { color: #7b83f6; }
+        .checker-stat.invalid .value { color: var(--red); }
+        .checker-stat.available .value { color: var(--green); }
+        .checker-stat.retrying .value { color: var(--gold); }
+        @media (max-width: 430px) {
+            .checker-stats { grid-template-columns: repeat(2, 1fr); }
+        }
 
         .spinner {
             display: inline-block;
@@ -486,7 +521,13 @@
 
             <div class="progress-wrap">
                 <div class="progress-outer"><div class="progress-inner" id="progressBar"></div></div>
-                <div class="progress-label"><span id="progressText">0 / 0</span><span id="foundCount">Found: 0</span></div>
+                <div class="progress-label"><span id="progressText">0 / 0</span><span id="foundCount">Available: 0</span></div>
+                <div class="checker-stats" aria-live="polite" aria-label="Username check results">
+                    <div class="checker-stat checked"><span class="value" id="checkedCount">0</span><span class="label">Checked</span></div>
+                    <div class="checker-stat invalid"><span class="value" id="invalidCount">0</span><span class="label">Invalid</span></div>
+                    <div class="checker-stat available"><span class="value" id="availableCount">0</span><span class="label">Available</span></div>
+                    <div class="checker-stat retrying"><span class="value" id="retryingCount">0</span><span class="label">Retrying</span></div>
+                </div>
             </div>
 
             <div class="found-badges" id="foundBadges"></div>
@@ -743,13 +784,21 @@
             const progressBar = document.getElementById('progressBar');
             const progressText = document.getElementById('progressText');
             const foundCountEl = document.getElementById('foundCount');
+            const checkedCountEl = document.getElementById('checkedCount');
+            const invalidCountEl = document.getElementById('invalidCount');
+            const availableCountEl = document.getElementById('availableCount');
+            const retryingCountEl = document.getElementById('retryingCount');
             const badges = document.getElementById('foundBadges');
             const btnStop = document.getElementById('btnStop');
 
             log.innerHTML = '';
             badges.innerHTML = '';
             progressBar.style.width = '0%';
-            foundCountEl.textContent = 'Found: 0';
+            foundCountEl.textContent = 'Available: 0';
+            checkedCountEl.textContent = '0';
+            invalidCountEl.textContent = '0';
+            availableCountEl.textContent = '0';
+            retryingCountEl.textContent = '0';
             btnStop.disabled = false;
             document.querySelectorAll('#btn2, #btn3, #btn4').forEach(b => b.disabled = true);
 
@@ -790,7 +839,7 @@
                         if (!line.startsWith('data: ')) continue;
                         try {
                             const event = JSON.parse(line.slice(6));
-                            handleEvent(event, log, progressBar, progressText, foundCountEl, badges);
+                            handleEvent(event, log, progressBar, progressText, foundCountEl, checkedCountEl, invalidCountEl, availableCountEl, retryingCountEl, badges);
                         } catch (e) {}
                     }
                 }
@@ -808,16 +857,25 @@
             }
         }
 
-        function handleEvent(event, log, bar, ptext, fcount, badges) {
-            const pct = event.total ? (event.checked / event.total * 100).toFixed(1) : 0;
+        function handleEvent(event, log, bar, ptext, fcount, checkedEl, invalidEl, availableEl, retryingEl, badges) {
+            const checked = Number(event.checked || 0);
+            const invalid = Number(event.invalid || 0);
+            const available = Number(event.available || 0);
+            const retrying = Number(event.retrying || 0);
+            const pct = event.total ? (checked / event.total * 100).toFixed(1) : 0;
             bar.style.width = `${pct}%`;
-            ptext.textContent = event.total ? `${event.checked.toLocaleString()} / ${event.total.toLocaleString()}` : '';
+            ptext.textContent = event.total ? `${checked.toLocaleString()} / ${event.total.toLocaleString()}` : '';
+            checkedEl.textContent = checked.toLocaleString();
+            invalidEl.textContent = invalid.toLocaleString();
+            availableEl.textContent = available.toLocaleString();
+            retryingEl.textContent = retrying.toLocaleString();
+            fcount.textContent = `Available: ${available.toLocaleString()}`;
 
             switch (event.event) {
                 case 'found':
                     foundUsernames.push(event.username);
                     logEntry(log, `&#x2705; ${event.username} — AVAILABLE`, 'found');
-                    fcount.textContent = `Found: ${foundUsernames.length}`;
+                    fcount.textContent = `Available: ${available.toLocaleString()}`;
                     const b = document.createElement('span');
                     b.className = 'found-badge';
                     b.textContent = event.username;
@@ -840,10 +898,11 @@
 
                 case 'complete':
                     bar.style.width = '100%';
-                    if (event.available.length === 0) {
-                        logEntry(log, `Done — no available usernames found in ${event.checked.toLocaleString()} definitive checks.`, 'progress');
+                    const availableNames = event.available_names || [];
+                    if (availableNames.length === 0) {
+                        logEntry(log, `Done — no available usernames found in ${checked.toLocaleString()} classified checks.`, 'progress');
                     } else {
-                        logEntry(log, `Done! Found ${event.available.length} available in ${event.checked.toLocaleString()} definitive checks.`, 'progress');
+                        logEntry(log, `Done! Found ${availableNames.length} available in ${checked.toLocaleString()} classified checks.`, 'progress');
                     }
                     break;
             }

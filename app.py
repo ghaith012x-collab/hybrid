@@ -1314,6 +1314,14 @@ def check_usernames():
     stop_event = threading.Event()
     checked_count = [0]
     available_list = []
+    # Live, mutually exclusive username-result counters. A retryable result is
+    # visible as "Retrying" so the UI never presents a blocked route as invalid.
+    check_stats = {
+        "checked": 0,
+        "invalid": 0,
+        "available": 0,
+        "retrying": 0,
+    }
     fatal_error = [None]
     stats_lock = threading.Lock()
     fatal_lock = threading.Lock()
@@ -1344,14 +1352,9 @@ def check_usernames():
             if res is None:
                 res = {"available": None, "status": None, "discord_msg": "No response", "fatal": False, "retryable": True}
 
-            with stats_lock:
-                checked_count[0] += 1
-
-            if res.get("available") is True:
-                with stats_lock:
-                    available_list.append(combo)
-                result_queue.put({"type": "found", "username": combo})
-            elif res.get("fatal"):
+            # A fatal token error is not a username result. Keep it out of the
+            # counters; the UI will show the separate fatal event instead.
+            if res.get("fatal"):
                 # Only a separately confirmed invalid token is fatal. Guard this so
                 # five workers cannot emit five different fatal events at once.
                 with fatal_lock:
@@ -1364,7 +1367,31 @@ def check_usernames():
                         })
                         stop_event.set()
                 return
+
+            # Every non-fatal username attempt gets exactly one classification.
+            # `available=False` is definitive Invalid; retryable/unknown stays
+            # visible as Retrying instead of being falsely called Invalid.
+            with stats_lock:
+                checked_count[0] += 1
+                check_stats["checked"] += 1
+                if res.get("available") is True:
+                    check_stats["available"] += 1
+                elif res.get("available") is False:
+                    check_stats["invalid"] += 1
+                else:
+                    check_stats["retrying"] += 1
+
+            # Push a progress event for every completed classification, including
+            # definitive Invalid results that do not emit a `found` event.
+            result_queue.put({"type": "progress"})
+
+            if res.get("available") is True:
+                with stats_lock:
+                    available_list.append(combo)
+                result_queue.put({"type": "found", "username": combo})
             elif res.get("retryable"):
+                # The result is already counted above; this message is only the
+                # first explanatory warning for the operator.
                 with fatal_lock:
                     if not warning_sent[0]:
                         warning_sent[0] = True
@@ -1392,20 +1419,36 @@ def check_usernames():
         while done_workers < num_workers:
             try:
                 msg = result_queue.get(timeout=60)
+                with stats_lock:
+                    snapshot = dict(check_stats)
+                snapshot["total"] = total
+
                 if msg["type"] == "found":
-                    yield f"data: {json.dumps({'event': 'found', 'username': msg['username'], 'checked': checked_count[0], 'total': total})}\n\n"
+                    snapshot.update({"event": "found", "username": msg["username"]})
+                    yield f"data: {json.dumps(snapshot)}\n\n"
                 elif msg["type"] == "fatal":
-                    yield f"data: {json.dumps({'event': 'fatal', 'message': msg['message'], 'status': msg.get('status'), 'checked': checked_count[0], 'total': total})}\n\n"
+                    snapshot.update({"event": "fatal", "message": msg["message"], "status": msg.get("status")})
+                    yield f"data: {json.dumps(snapshot)}\n\n"
                     return
                 elif msg["type"] == "warning":
-                    yield f"data: {json.dumps({'event': 'warning', 'message': msg['message'], 'checked': checked_count[0], 'total': total})}\n\n"
+                    snapshot.update({"event": "warning", "message": msg["message"]})
+                    yield f"data: {json.dumps(snapshot)}\n\n"
+                elif msg["type"] == "progress":
+                    snapshot["event"] = "progress"
+                    yield f"data: {json.dumps(snapshot)}\n\n"
                 elif msg["type"] == "done":
                     done_workers += 1
             except queue.Empty:
-                yield f"data: {json.dumps({'event': 'progress', 'checked': checked_count[0], 'total': total})}\n\n"
+                with stats_lock:
+                    snapshot = dict(check_stats)
+                snapshot.update({"event": "progress", "total": total})
+                yield f"data: {json.dumps(snapshot)}\n\n"
 
         if fatal_error[0] is None:
-            yield f"data: {json.dumps({'event': 'complete', 'available': available_list, 'checked': checked_count[0], 'total': total})}\n\n"
+            with stats_lock:
+                snapshot = dict(check_stats)
+            snapshot.update({"event": "complete", "available_names": list(available_list), "total": total})
+            yield f"data: {json.dumps(snapshot)}\n\n"
 
     return Response(
         stream_with_context(generate()),
