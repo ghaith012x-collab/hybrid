@@ -401,7 +401,7 @@ def _check_username_via_register(username, proxy_url=None, cam_id=None):
 
                 if input_el is None:
                     context.close()
-                    return {"available": None, "detail": "Could not find username input on register page"}
+                    return {"available": None, "guessed": True, "detail": "Could not find username input on register page"}
 
                 try:
                     input_el.click()
@@ -464,7 +464,7 @@ def _check_username_via_register(username, proxy_url=None, cam_id=None):
                 _snap_cam(cam_id, page, f"{username}: likely taken")
                 context.close()
                 elapsed = time.time() - t0
-                return {"available": False, "detail": f"Likely taken (no availability indicator) · {elapsed:.1f}s"}
+                return {"available": False, "guessed": True, "detail": f"Likely taken (no availability indicator) · {elapsed:.1f}s"}
 
             finally:
                 try:
@@ -1295,6 +1295,7 @@ def check_usernames():
     warning_sent = [False]
 
     BROWSER_RECYCLE_EVERY = 20  # restart browser + rotate IP every N checks per worker
+    CHECKER_RETRY_ATTEMPTS = 3  # re-check ambiguous "likely taken" results with a fresh proxy/IP
 
     def worker(combo_batch, worker_id):
         checks_since_recycle = 0
@@ -1308,17 +1309,28 @@ def check_usernames():
                 checks_since_recycle = 0
                 time.sleep(random.uniform(3, 6))  # cooldown between browser sessions
 
-            proxy_url = None
-            if use_proxy and proxy_list:
-                idx = (worker_id + position) % len(proxy_list)
-                # Also rotate on recycle for a fresh IP
-                if checks_since_recycle == 0 and position > 0:
-                    idx = (worker_id + position + 1) % len(proxy_list)
-                proxy_url = proxy_list[idx]
-
             # Each check opens a fresh browser (via _check_username_via_register).
             # Playwright creates a new context per call, so cookies/cache are inherently fresh.
-            result = _check_username_via_register(combo, proxy_url, cam_id=f"chk{worker_id}")
+            # On an ambiguous "likely taken" result (no availability indicator), close the
+            # browser, clear cache, rotate to the next proxy, and re-check before calling it taken.
+            result = None
+            for attempt in range(1, CHECKER_RETRY_ATTEMPTS + 1):
+                if stop_event.is_set():
+                    return
+                proxy_url = None
+                if use_proxy and proxy_list:
+                    idx = (worker_id + position + attempt) % len(proxy_list)
+                    proxy_url = proxy_list[idx]
+                result = _check_username_via_register(combo, proxy_url, cam_id=f"chk{worker_id}")
+                if not result.get("guessed"):
+                    break  # definitive answer (available / taken / browser error)
+                # Ambiguous — log the retry, cooldown, and try again with a fresh IP.
+                if attempt < CHECKER_RETRY_ATTEMPTS:
+                    result_queue.put({
+                        "type": "warning",
+                        "message": f"🔄 {combo}: no availability indicator (attempt {attempt}/{CHECKER_RETRY_ATTEMPTS}) — closing browser, clearing cache, rotating proxy, re-checking…",
+                    })
+                    time.sleep(random.uniform(2, 4))
             checks_since_recycle += 1
 
             avail = result.get("available")
