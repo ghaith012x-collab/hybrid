@@ -892,9 +892,9 @@
                     const invalidNames = event.invalid_names || [];
                     if (invalidCountLive) invalidCountLive.textContent = invalidNames.length.toLocaleString();
                     if (availableNames.length === 0) {
-                        logEntry(log, `Done — no available usernames found in ${checked.toLocaleString()} classified checks. ${invalidNames.length.toLocaleString()} invalid/taken.`, 'progress');
+                        logEntry(log, `Done — no available usernames found. Checked: ${checked.toLocaleString()} · Invalid: ${invalid.toLocaleString()} · Available: ${available.toLocaleString()}.`, 'progress');
                     } else {
-                        logEntry(log, `Done! Found ${availableNames.length} available, ${invalidNames.length.toLocaleString()} invalid/taken in ${checked.toLocaleString()} classified checks.`, 'progress');
+                        logEntry(log, `Done! Checked: ${checked.toLocaleString()} · Invalid: ${invalid.toLocaleString()} · Available: ${available.toLocaleString()}.`, 'progress');
                     }
                     break;
             }

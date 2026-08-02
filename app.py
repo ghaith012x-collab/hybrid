@@ -32,6 +32,19 @@ VIEW_COUNT = 0
 VIEW_LOCK = threading.Lock()
 TOR_AVAILABLE = False
 
+# Hard cap on concurrent browser processes (Playwright/Chrome). Each headless
+# Chromium spawns many OS threads; without a cap, a checker run plus the gun bot
+# can exhaust the container's thread/pid limit ("RuntimeError: can't start new
+# thread") and take the whole app down. Every browser launch acquires this.
+MAX_CONCURRENT_BROWSERS = 6
+BROWSER_SEM = threading.Semaphore(MAX_CONCURRENT_BROWSERS)
+
+# Active username-checker session registry. Only one checker run is allowed at a
+# time; starting a new one stops the previous (which otherwise keeps burning
+# browsers in the background after a page refresh kills its SSE stream).
+CHECKER_SESSION_LOCK = threading.Lock()
+CHECKER_ACTIVE_STOP = [None]
+
 # ── Bot state (shared, thread-safe) ────────────────────────────────────
 BOT_LOCK = threading.Lock()
 BOT_STOP = threading.Event()
@@ -303,9 +316,13 @@ DISCORD_USERNAME_SELECTORS = [
 
 # Text markers that indicate a username is TAKEN (unavailable)
 DISCORD_UNAVAILABLE_MARKERS = [
-    "unavailable",
+    "this username is taken",
+    "that username is taken",
+    "username is taken",
     "username is unavailable",
+    "unavailable",
     "you can't use this username",
+    "you cannot use this username",
     "already taken",
     "too many users have this username",
 ]
@@ -313,169 +330,248 @@ DISCORD_UNAVAILABLE_MARKERS = [
 # Text markers that indicate a username is AVAILABLE
 DISCORD_AVAILABLE_MARKERS = [
     "you're good to go",
+    "you are good to go",
+    "good to go",
     "username is available",
-    "available",
+    "this username is available",
 ]
 
+CHECKER_RECYCLE_EVERY = 20   # close + relaunch the whole browser every N checks per worker
+CHECKER_RETRY_ATTEMPTS = 2   # re-check ambiguous results with a fresh context/IP
 
-def _check_username_via_register(username, proxy_url=None, cam_id=None):
-    """Check one Discord username by filling the register form in a real browser.
 
-    Navigates to https://discord.com/register, types the username, waits for
-    Discord's inline validation, and reads whether it shows 'unavailable' or
-    the green 'available' indicator.
+def _read_discord_verdict(page, input_el):
+    """Inspect the register page for Discord's inline username verdict.
 
-    Returns {"available": bool|None, "detail": str}
+    Returns (available: bool|None, hint: str). None = no availability indicator
+    yet (keep waiting / treat as likely taken).
     """
-    from playwright.sync_api import sync_playwright
-
-    ua = random.choice(USER_AGENTS)
-    viewport = random.choice([(1366, 768), (1440, 900), (1536, 864), (1920, 1080), (1280, 720)])
-
-    launch_opts = {
-        "headless": True,
-        "args": [
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-application-cache",
-            "--aggressive-cache-discard",
-            "--disable-features=BackForwardCache",
-            "--lang=en-US",
-        ],
-    }
-    if proxy_url:
-        server, user, pw = _browser_proxy(proxy_url)
-        if server:
-            launch_opts["proxy"] = {"server": server}
-            if user:
-                launch_opts["proxy"]["username"] = user
-            if pw:
-                launch_opts["proxy"]["password"] = pw
-
-    t0 = time.time()
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(**launch_opts)
+        body_text = (page.content() or "").lower()
+    except Exception:
+        body_text = ""
+    for marker in DISCORD_UNAVAILABLE_MARKERS:
+        if marker in body_text:
+            return False, f"Taken ({marker})"
+    for marker in DISCORD_AVAILABLE_MARKERS:
+        if marker in body_text:
+            return True, f"Available ({marker})"
+    try:
+        if (input_el.get_attribute("aria-invalid") or "").lower() == "true":
+            return False, "Taken (aria-invalid=true)"
+    except Exception:
+        pass
+    try:
+        for e in page.query_selector_all("[class*='error' i], [class*='invalid' i], [class*='success' i]"):
             try:
-                context = browser.new_context(
-                    user_agent=ua,
-                    viewport={"width": viewport[0], "height": viewport[1]},
-                    locale="en-US",
-                    timezone_id=random.choice(["America/New_York", "Europe/London", "Asia/Tokyo", "Australia/Sydney"]),
-                    extra_http_headers={"Accept-Language": "en-US,en;q=0.9", "Referer": "https://www.google.com/"},
-                )
+                txt = (e.text_content() or "").lower()
+                if any(m in txt for m in DISCORD_UNAVAILABLE_MARKERS):
+                    return False, "Taken (error element)"
+                if any(m in txt for m in DISCORD_AVAILABLE_MARKERS):
+                    return True, "Available (success element)"
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None, "no indicator"
+
+
+class CheckerSession:
+    """One browser owned by one checker worker, reused across checks.
+
+    - New context per check: clean cookies/cache so every check looks fresh.
+    - Rotated proxy per check: fresh IP appearance (no proxy pool = direct).
+    - Full browser recycle every CHECKER_RECYCLE_EVERY checks: closes and
+      relaunches the browser, satisfying the "leave browser, clear cache,
+      rotate, come back" flow without spawning a browser per username (which
+      is what exhausted the container's threads and crashed the app).
+    """
+
+    def __init__(self, worker_id, use_proxy, proxy_list, cam_id):
+        self.worker_id = worker_id
+        self.use_proxy = use_proxy
+        self.proxy_list = proxy_list or []
+        self.cam_id = cam_id
+        self.browser = None
+        self.pw = None
+        self.checks_since_recycle = 0
+
+    def _pick_proxy(self, position):
+        if not (self.use_proxy and self.proxy_list):
+            return None
+        return self.proxy_list[(self.worker_id + position + self.checks_since_recycle) % len(self.proxy_list)]
+
+    def _launch(self, proxy_url):
+        """Launch the worker's browser, holding a concurrency slot for its lifetime."""
+        from playwright.sync_api import sync_playwright
+        launch_opts = {
+            "headless": True,
+            "args": [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-application-cache",
+                "--aggressive-cache-discard",
+                "--disable-features=BackForwardCache",
+                "--lang=en-US",
+            ],
+        }
+        if proxy_url:
+            server, user, pw = _browser_proxy(proxy_url)
+            if server:
+                launch_opts["proxy"] = {"server": server}
+                if user:
+                    launch_opts["proxy"]["username"] = user
+                if pw:
+                    launch_opts["proxy"]["password"] = pw
+        self.pw = sync_playwright().start()
+        try:
+            self.browser = self.pw.chromium.launch(**launch_opts)
+        except Exception:
+            try:
+                self.pw.stop()
+            except Exception:
+                pass
+            self.pw = None
+            raise
+
+    def close(self):
+        """Close the browser and release its concurrency slot (idempotent)."""
+        if self.browser is not None:
+            try:
+                self.browser.close()
+            except Exception:
+                pass
+            self.browser = None
+            BROWSER_SEM.release()
+        if self.pw is not None:
+            try:
+                self.pw.stop()
+            except Exception:
+                pass
+            self.pw = None
+
+    def check(self, username, position):
+        """Check one username. Returns {"available": bool|None, "detail": str, "guessed": bool}."""
+        proxy_url = self._pick_proxy(position)
+
+        # Recycle window reached → close and relaunch the whole browser (fresh
+        # fingerprint/cache/identity), then continue on the next proxy.
+        if self.checks_since_recycle >= CHECKER_RECYCLE_EVERY:
+            self.checks_since_recycle = 0
+            self.close()
+            time.sleep(random.uniform(2, 4))
+        if self.browser is None:
+            BROWSER_SEM.acquire()
+            try:
+                self._launch(proxy_url)
+            except Exception as e:
+                BROWSER_SEM.release()
+                return {"available": None, "detail": f"Browser launch error: {type(e).__name__}: {str(e)[:100]}"}
+
+        self.checks_since_recycle += 1
+        return self._check_in_context(username, proxy_url)
+
+    def _check_in_context(self, username, proxy_url):
+        t0 = time.time()
+        context = None
+        try:
+            ua = random.choice(USER_AGENTS)
+            viewport = random.choice([(1366, 768), (1440, 900), (1536, 864), (1920, 1080), (1280, 720)])
+            ctx_opts = {
+                "user_agent": ua,
+                "viewport": {"width": viewport[0], "height": viewport[1]},
+                "locale": "en-US",
+                "timezone_id": random.choice(["America/New_York", "Europe/London", "Asia/Tokyo", "Australia/Sydney"]),
+                "extra_http_headers": {"Accept-Language": "en-US,en;q=0.9", "Referer": "https://www.google.com/"},
+            }
+            if proxy_url:
+                server, user, pw = _browser_proxy(proxy_url)
+                if server:
+                    ctx_opts["proxy"] = {"server": server}
+                    if user:
+                        ctx_opts["proxy"]["username"] = user
+                    if pw:
+                        ctx_opts["proxy"]["password"] = pw
+            context = self.browser.new_context(**ctx_opts)
+            page = context.new_page()
+
+            def snap(label):
+                _snap_cam(self.cam_id, page, label)
+
+            page.goto("https://discord.com/register", timeout=30000, wait_until="domcontentloaded")
+            page.wait_for_timeout(1500)
+            snap("register open")
+
+            input_el = None
+            for sel in DISCORD_USERNAME_SELECTORS:
                 try:
-                    context.clear_cookies()
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        input_el = el
+                        break
                 except Exception:
-                    pass
-
-                page = context.new_page()
-                resp = page.goto("https://discord.com/register", timeout=30000, wait_until="domcontentloaded")
-                page.wait_for_timeout(2000)
-                _snap_cam(cam_id, page, "register page open")
-
-                input_el = None
-                for sel in DISCORD_USERNAME_SELECTORS:
-                    try:
-                        el = page.query_selector(sel)
-                        if el and el.is_visible():
-                            input_el = el
-                            break
-                    except Exception:
-                        continue
-
-                if input_el is None:
-                    try:
-                        all_inputs = page.query_selector_all("input[type='text']")
-                        for inp in all_inputs:
-                            try:
-                                if inp.is_visible():
-                                    input_el = inp
-                                    break
-                            except Exception:
-                                continue
-                    except Exception:
-                        pass
-
-                if input_el is None:
-                    context.close()
-                    return {"available": None, "guessed": True, "detail": "Could not find username input on register page"}
-
+                    continue
+            if input_el is None:
                 try:
-                    input_el.click()
-                    page.wait_for_timeout(300)
-                    input_el.fill("")
-                    page.wait_for_timeout(200)
-                    input_el.type(username, delay=random.randint(40, 100))
-                    _snap_cam(cam_id, page, f"typing {username}")
-                except Exception:
-                    context.close()
-                    return {"available": None, "detail": "Could not type username into register form"}
-
-                page.wait_for_timeout(random.randint(1800, 3000))
-                _snap_cam(cam_id, page, f"checking {username}")
-
-                try:
-                    body_text = (page.content() or "").lower()
-                except Exception:
-                    body_text = ""
-
-                for marker in DISCORD_UNAVAILABLE_MARKERS:
-                    if marker in body_text:
-                        _snap_cam(cam_id, page, f"{username}: taken")
-                        context.close()
-                        elapsed = time.time() - t0
-                        return {"available": False, "detail": f"Taken ({marker}) · {elapsed:.1f}s"}
-
-                for marker in DISCORD_AVAILABLE_MARKERS:
-                    if marker in body_text:
-                        _snap_cam(cam_id, page, f"{username}: available")
-                        context.close()
-                        elapsed = time.time() - t0
-                        return {"available": True, "detail": f"Available · {elapsed:.1f}s"}
-
-                try:
-                    aria_invalid = input_el.get_attribute("aria-invalid")
-                    if aria_invalid == "true":
-                        _snap_cam(cam_id, page, f"{username}: taken")
-                        context.close()
-                        elapsed = time.time() - t0
-                        return {"available": False, "detail": f"Taken (aria-invalid=true) · {elapsed:.1f}s"}
-                except Exception:
-                    pass
-
-                try:
-                    error_els = page.query_selector_all("[class*='error'], [class*='Error'], [class*='invalid']")
-                    for e in error_els:
+                    for inp in page.query_selector_all("input[type='text']"):
                         try:
-                            txt = (e.text_content() or "").lower()
-                            if any(m in txt for m in DISCORD_UNAVAILABLE_MARKERS):
-                                _snap_cam(cam_id, page, f"{username}: taken")
-                                context.close()
-                                elapsed = time.time() - t0
-                                return {"available": False, "detail": f"Taken (error element) · {elapsed:.1f}s"}
+                            if inp.is_visible():
+                                input_el = inp
+                                break
                         except Exception:
                             continue
                 except Exception:
                     pass
+            if input_el is None:
+                return {"available": None, "guessed": True, "detail": "Could not find username input on register page"}
 
-                _snap_cam(cam_id, page, f"{username}: likely taken")
-                context.close()
-                elapsed = time.time() - t0
-                return {"available": False, "guessed": True, "detail": f"Likely taken (no availability indicator) · {elapsed:.1f}s"}
+            try:
+                input_el.click()
+                page.wait_for_timeout(250)
+                input_el.fill("")
+                input_el.type(username, delay=random.randint(35, 80))
+            except Exception:
+                return {"available": None, "detail": "Could not type username into register form"}
 
-            finally:
+            # Blur the field so Discord runs its inline availability validation.
+            try:
+                page.keyboard.press("Tab")
+            except Exception:
                 try:
-                    browser.close()
+                    page.mouse.click(viewport[0] // 2, 30)
                 except Exception:
                     pass
+            snap(f"typing {username}")
 
-    except Exception as e:
-        elapsed = time.time() - t0
-        msg = f"{type(e).__name__}: {str(e)[:120]}"
-        return {"available": None, "detail": f"Browser error: {msg} · {elapsed:.1f}s"}
+            avail, hint = None, "no indicator"
+            deadline = time.time() + 9
+            while time.time() < deadline:
+                page.wait_for_timeout(650)
+                avail, hint = _read_discord_verdict(page, input_el)
+                if avail is not None:
+                    break
+
+            elapsed = time.time() - t0
+            if avail is True:
+                snap(f"{username}: available")
+                return {"available": True, "detail": f"Available · {elapsed:.1f}s"}
+            if avail is False:
+                snap(f"{username}: taken")
+                return {"available": False, "detail": f"Taken ({hint}) · {elapsed:.1f}s"}
+            snap(f"{username}: likely taken")
+            return {"available": False, "guessed": True, "detail": f"Likely taken (no availability indicator) · {elapsed:.1f}s"}
+        except Exception as e:
+            elapsed = time.time() - t0
+            return {"available": None, "detail": f"Browser error: {type(e).__name__}: {str(e)[:100]} · {elapsed:.1f}s"}
+        finally:
+            try:
+                if context is not None:
+                    context.close()
+            except Exception:
+                pass
+
 
 # ── guns.lol view bot engine ───────────────────────────────────────────
 
@@ -835,6 +931,15 @@ def _click_through_gate(page, width, height, on_frame=None):
 
 
 def _send_playwright_view(target_url, proxy_url, cam_id=None):
+    """Load a target URL in a real browser, bounded by the global concurrency cap."""
+    BROWSER_SEM.acquire()
+    try:
+        return _send_playwright_view_locked(target_url, proxy_url, cam_id)
+    finally:
+        BROWSER_SEM.release()
+
+
+def _send_playwright_view_locked(target_url, proxy_url, cam_id=None):
     from playwright.sync_api import sync_playwright
     ua = random.choice(USER_AGENTS)
     viewport = random.choice([(1366, 768), (1440, 900), (1536, 864), (1920, 1080), (1280, 720)])
@@ -977,6 +1082,15 @@ def _send_playwright_view(target_url, proxy_url, cam_id=None):
 
 
 def _send_chrome_view(target_url, proxy_url, cam_id=None):
+    """Load a target URL via undetected_chromedriver, bounded by the global cap."""
+    BROWSER_SEM.acquire()
+    try:
+        return _send_chrome_view_locked(target_url, proxy_url, cam_id)
+    finally:
+        BROWSER_SEM.release()
+
+
+def _send_chrome_view_locked(target_url, proxy_url, cam_id=None):
     import undetected_chromedriver as uc
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.common.by import By
@@ -1278,6 +1392,13 @@ def check_usernames():
     total = len(combinations)
     result_queue = queue.Queue()
     stop_event = threading.Event()
+    # One checker run at a time: stop any previous session whose SSE stream died
+    # (page refresh/close) but whose workers kept running browsers in the background.
+    with CHECKER_SESSION_LOCK:
+        prev = CHECKER_ACTIVE_STOP[0]
+        if prev is not None:
+            prev.set()
+        CHECKER_ACTIVE_STOP[0] = stop_event
     checked_count = [0]
     available_list = []
     invalid_list = []
@@ -1294,44 +1415,29 @@ def check_usernames():
     fatal_lock = threading.Lock()
     warning_sent = [False]
 
-    BROWSER_RECYCLE_EVERY = 20  # restart browser + rotate IP every N checks per worker
-    CHECKER_RETRY_ATTEMPTS = 3  # re-check ambiguous "likely taken" results with a fresh proxy/IP
-
     def worker(combo_batch, worker_id):
-        checks_since_recycle = 0
-        for position, combo in enumerate(combo_batch):
-            if stop_event.is_set():
-                return
-
-            # Every 20 checks: pause briefly so the new browser context gets a clean slate,
-            # then rotate to the next proxy (or stay direct) for a fresh IP appearance.
-            if checks_since_recycle >= BROWSER_RECYCLE_EVERY:
-                checks_since_recycle = 0
-                time.sleep(random.uniform(3, 6))  # cooldown between browser sessions
-
-            # Each check opens a fresh browser (via _check_username_via_register).
-            # Playwright creates a new context per call, so cookies/cache are inherently fresh.
-            # On an ambiguous "likely taken" result (no availability indicator), close the
-            # browser, clear cache, rotate to the next proxy, and re-check before calling it taken.
-            result = None
-            for attempt in range(1, CHECKER_RETRY_ATTEMPTS + 1):
+        # One browser per worker, reused across checks (fresh context + rotated
+        # proxy per check, full browser recycle every CHECKER_RECYCLE_EVERY checks).
+        session = CheckerSession(worker_id, use_proxy, proxy_list, cam_id=f"chk{worker_id}")
+        try:
+            for position, combo in enumerate(combo_batch):
                 if stop_event.is_set():
                     return
-                proxy_url = None
-                if use_proxy and proxy_list:
-                    idx = (worker_id + position + attempt) % len(proxy_list)
-                    proxy_url = proxy_list[idx]
-                result = _check_username_via_register(combo, proxy_url, cam_id=f"chk{worker_id}")
-                if not result.get("guessed"):
-                    break  # definitive answer (available / taken / browser error)
-                # Ambiguous — log the retry, cooldown, and try again with a fresh IP.
-                if attempt < CHECKER_RETRY_ATTEMPTS:
-                    result_queue.put({
-                        "type": "warning",
-                        "message": f"🔄 {combo}: no availability indicator (attempt {attempt}/{CHECKER_RETRY_ATTEMPTS}) — closing browser, clearing cache, rotating proxy, re-checking…",
-                    })
-                    time.sleep(random.uniform(2, 4))
-            checks_since_recycle += 1
+                result = None
+                for attempt in range(1, CHECKER_RETRY_ATTEMPTS + 1):
+                    if stop_event.is_set():
+                        return
+                    result = session.check(combo, position)
+                    if not result.get("guessed"):
+                        break  # definitive answer (available / taken / browser error)
+                    # Ambiguous — log the retry, cooldown, and re-check with a fresh
+                    # context + rotated proxy (the session handles the rotation).
+                    if attempt < CHECKER_RETRY_ATTEMPTS:
+                        result_queue.put({
+                            "type": "warning",
+                            "message": f"🔄 {combo}: {result.get('detail', 'no availability indicator')[:70]} (attempt {attempt}/{CHECKER_RETRY_ATTEMPTS}) — fresh context + rotated proxy, re-checking…",
+                        })
+                        time.sleep(random.uniform(1.5, 3))
 
             avail = result.get("available")
             detail = result.get("detail", "")
@@ -1367,8 +1473,9 @@ def check_usernames():
                         })
 
             # Small jitter between checks to avoid pattern detection
-            time.sleep(random.uniform(0.8, 2.2))
-
+            time.sleep(random.uniform(0.5, 1.5))
+        finally:
+            session.close()
         result_queue.put({"type": "done"})
 
     num_workers = min(5, len(combinations))
@@ -1384,45 +1491,59 @@ def check_usernames():
         t.start()
 
     def generate():
-        done_workers = 0
-        while done_workers < num_workers:
-            try:
-                msg = result_queue.get(timeout=60)
-                with stats_lock:
-                    snapshot = dict(check_stats)
-                snapshot["total"] = total
-                with CAM_LOCK:
-                    snapshot["cams"] = {k: {"ts": v.get("ts", 0), "label": v.get("label", "")} for k, v in CAM_BUFFER.items() if k.startswith("chk")}
+        try:
+            done_workers = 0
+            while done_workers < num_workers:
+                if stop_event.is_set():
+                    break
+                try:
+                    msg = result_queue.get(timeout=60)
+                    with stats_lock:
+                        snapshot = dict(check_stats)
+                    snapshot["total"] = total
+                    with CAM_LOCK:
+                        snapshot["cams"] = {k: {"ts": v.get("ts", 0), "label": v.get("label", "")} for k, v in CAM_BUFFER.items() if k.startswith("chk")}
 
-                if msg["type"] == "found":
-                    snapshot.update({"event": "found", "username": msg["username"]})
+                    if msg["type"] == "found":
+                        snapshot.update({"event": "found", "username": msg["username"]})
+                        yield f"data: {json.dumps(snapshot)}\n\n"
+                    elif msg["type"] == "invalid":
+                        snapshot.update({"event": "invalid", "username": msg["username"]})
+                        yield f"data: {json.dumps(snapshot)}\n\n"
+                    elif msg["type"] == "fatal":
+                        snapshot.update({"event": "fatal", "message": msg["message"], "status": msg.get("status")})
+                        yield f"data: {json.dumps(snapshot)}\n\n"
+                        return
+                    elif msg["type"] == "warning":
+                        snapshot.update({"event": "warning", "message": msg["message"]})
+                        yield f"data: {json.dumps(snapshot)}\n\n"
+                    elif msg["type"] == "progress":
+                        snapshot["event"] = "progress"
+                        yield f"data: {json.dumps(snapshot)}\n\n"
+                    elif msg["type"] == "done":
+                        done_workers += 1
+                except queue.Empty:
+                    with stats_lock:
+                        snapshot = dict(check_stats)
+                    snapshot.update({"event": "progress", "total": total})
                     yield f"data: {json.dumps(snapshot)}\n\n"
-                elif msg["type"] == "invalid":
-                    snapshot.update({"event": "invalid", "username": msg["username"]})
-                    yield f"data: {json.dumps(snapshot)}\n\n"
-                elif msg["type"] == "fatal":
-                    snapshot.update({"event": "fatal", "message": msg["message"], "status": msg.get("status")})
-                    yield f"data: {json.dumps(snapshot)}\n\n"
-                    return
-                elif msg["type"] == "warning":
-                    snapshot.update({"event": "warning", "message": msg["message"]})
-                    yield f"data: {json.dumps(snapshot)}\n\n"
-                elif msg["type"] == "progress":
-                    snapshot["event"] = "progress"
-                    yield f"data: {json.dumps(snapshot)}\n\n"
-                elif msg["type"] == "done":
-                    done_workers += 1
-            except queue.Empty:
+
+            if fatal_error[0] is None:
                 with stats_lock:
                     snapshot = dict(check_stats)
-                snapshot.update({"event": "progress", "total": total})
+                snapshot.update({"event": "complete", "available_names": list(available_list), "invalid_names": list(invalid_list), "total": total})
                 yield f"data: {json.dumps(snapshot)}\n\n"
-
-        if fatal_error[0] is None:
-            with stats_lock:
-                snapshot = dict(check_stats)
-            snapshot.update({"event": "complete", "available_names": list(available_list), "invalid_names": list(invalid_list), "total": total})
-            yield f"data: {json.dumps(snapshot)}\n\n"
+        finally:
+            # Client disconnected / run finished / superseded: kill the workers so no
+            # browser keeps burning in the background (orphaned workers stacking
+            # Chromium processes is what caused the "can't start new thread" crash).
+            stop_event.set()
+            with CHECKER_SESSION_LOCK:
+                if CHECKER_ACTIVE_STOP[0] is stop_event:
+                    CHECKER_ACTIVE_STOP[0] = None
+            with CAM_LOCK:
+                for k in [k for k in CAM_BUFFER if k.startswith("chk")]:
+                    CAM_BUFFER.pop(k, None)
 
     return Response(
         stream_with_context(generate()),
@@ -1460,23 +1581,27 @@ def start_guns_lol():
     proxies = _normalize_proxies(data.get("proxies"))
     use_tor = bool(data.get("use_tor", True))
 
-    # Lazily bring Tor up if requested and it isn't running yet.
-    if use_tor and not TOR_AVAILABLE:
-        ensure_tor_instances()
+    # Warm Tor + the browser engine in the BACKGROUND so Start returns instantly.
+    if use_tor and not TOR_STARTED and not TOR_AVAILABLE:
+        threading.Thread(target=ensure_tor_instances, daemon=True).start()
+    if not ENGINE_PROBE_RESULT[0]:
+        threading.Thread(target=_run_engine_probe, daemon=True).start()
 
     # Pre-flight: check whether this target actually accepts Tor exits before
     # spawning a swarm that would just rack up 403s. Falls back to proxies/direct.
     tor_blocked = False
     if use_tor and TOR_AVAILABLE:
         bot_log("info", "Probing target through Tor (one test view)…")
-        probe_ok, probe_detail = tor_target_probe(target)
-        if probe_ok is False:
-            tor_blocked = True
-            bot_log("warn", f"Target rejects Tor exits ({probe_detail}) — starting WITHOUT Tor. " + ("Using your proxies instead." if proxies else "Using direct (single IP). Add residential proxies for real views."))
-        elif probe_ok is True:
-            bot_log("info", f"Tor probe passed — exits accepted ({probe_detail}).")
-        else:
-            bot_log("warn", "Tor probe inconclusive — starting with Tor rotation; workers auto-fallback if blocked.")
+        def _bg_probe():
+            probe_ok, probe_detail = tor_target_probe(target)
+            if probe_ok is False:
+                bot_log("warn", "Background Tor probe: target rejects Tor exits - falling back to proxies/direct.")
+            elif probe_ok is True:
+                bot_log("info", "Background Tor probe passed - exits accepted.")
+            else:
+                bot_log("warn", "Background Tor probe inconclusive - workers will fall back if blocked.")
+        threading.Thread(target=_bg_probe, daemon=True).start()
+        bot_log("info", "Tor probe running in the background; workers auto-fallback if exits are blocked.")
 
     if use_tor and TOR_AVAILABLE and not tor_blocked:
         proxies = []  # workers build socks5h://127.0.0.1:port from tor_idx directly
@@ -1484,8 +1609,10 @@ def start_guns_lol():
     elif not proxies:
         bot_log("warn", "No proxies configured — using direct connection (single IP). Views will be limited; add residential proxies.")
 
-    # Verify a browser really launches before spawning workers (cached after first probe).
-    engine = probe_engine(block=True, timeout=60)
+    # Engine may still be warming up in the background (probe kicked off above /
+    # on /status). Never block the request: workers pick the verified engine up
+    # as soon as the probe finishes and fall back to raw HTTP until then.
+    engine = ENGINE_PROBE_RESULT[0] or probe_engine(block=False) or "requests"
 
     BOT_STOP.clear()
     with BOT_LOCK:
@@ -1503,7 +1630,7 @@ def start_guns_lol():
         }
 
     bot_log("info", f"Starting {num_browsers} worker(s) · engine={engine} · tor={BOT_STATE['use_tor']} · proxies={len(proxies)}")
-    if engine == "requests":
+    if ENGINE_PROBE_RESULT[0] == "requests":
         bot_log("warn", "No browser found (Playwright/Chrome missing) — installing one in the background. Views start counting once it's ready.")
         _ensure_browser_install()
 
@@ -1584,7 +1711,9 @@ def verify_views():
     if not url or not url.startswith(("http://", "https://")):
         return jsonify({"error": "valid url required"}), 400
 
-    engine = probe_engine(block=True, timeout=60)
+    engine = ENGINE_PROBE_RESULT[0] or probe_engine(block=False) or "requests"
+    if engine == "requests" and not ENGINE_PROBE_RESULT[0]:
+        bot_log("warn", "verify_views: browser engine still warming up - results may be inconclusive; retry in a few seconds.")
     results, ok_count, beacon_count = [], 0, 0
     for _ in range(count):
         try:
